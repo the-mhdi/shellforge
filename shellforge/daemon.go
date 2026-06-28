@@ -324,10 +324,11 @@ func (d *Daemon) listen() {
 
 				log.Println("auth packet received")
 				AuthRes, err := d.shellAuth(session, pkt)
-				if err != nil {
-					return
+				if err != nil && i < MAX_AUTH_RETRY {
+					continue
 				}
-				if !AuthRes.Success {
+
+				if AuthRes.Success == false {
 					if i < MAX_AUTH_RETRY {
 						log.Printf("auth failed attempt %d", i)
 						session.WritePacket(MsgServerAuthResponse, AuthRes.Marshal())
