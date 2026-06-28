@@ -1,0 +1,56 @@
+[
+    {
+    "pubkey": "c161cd235cab272ee9e8e1ad3de0009d31f2da3c8bac927d3148fc6f1dff2e8f",
+    "key_expires_afer":"0",
+     "max_containers": 0,
+     "max_users": 10,
+      "max_namespaces":0,
+    "environment" : [
+        {
+            "type" : "container",
+            "setting": {
+                "dockerfile_path": "/etc/shellforge/",
+                "memory_limit": "1g",
+                 "cpu_limit": 1.5,
+                 "gpu_limit": "\"device=0\"" 
+            },
+            "life_span": "0",
+            "timeout":"0",
+            "one_time_use": false,
+            "survive_reboot": true
+        },
+        {
+            "type" : "systemUser",
+            "setting": {
+                    "shell": "/usr/bin/zsh",
+                    "HomeDir": "",
+                    "groupname": ""
+            },
+            "life_span": "2h",
+            "max_logins": 1,
+            "survive_reboot": true
+        },
+        {
+         "type" : "HostSharedNamespace",
+          "setting": {
+            "mount": [
+                "/bin",
+                "/etc",
+                "/use",
+                "/lib"
+            ],
+           
+            "life_span": "2h",
+            "survive_reboot": true
+
+          }
+        }
+    ]
+
+  },
+  {
+
+
+  }
+
+]

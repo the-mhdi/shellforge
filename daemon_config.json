@@ -1,0 +1,17 @@
+{
+    "AcceptedInitMsgs":[
+        "SHELLFORGE-v0.1.0-INIT",
+        "SHELLFORGE-CLIENT-INIT-MSG"
+    ],
+    "DaemonInitMsg":"SHELLFORGE-v0.1.0-INIT-SERVER",
+    "ListenAddr":"",
+    "Port":"77",
+    "PasswordAuth":true,
+    "PublicKeyAuth":true,
+    "AuthorizedKeysPath":"",
+    "AllowLoginAsRoot":false,
+    "MaxConnectionsAllowed":0,
+    "MaxContainersConnectionsAllowed":0,
+    "EnvironmentsJsonConfig":"",
+    "DatabaseDirectory":""
+}

@@ -1,0 +1,165 @@
+package shellforge
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/user"
+	"strings"
+
+	"github.com/msteinert/pam"
+)
+
+// only supports ed25519 and *ECDSA(not implemented)
+func VerifyClientSignature(filepath string, sessionID, signature, presentedPubKey []byte) (bool, error) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		//format type key
+		if len(parts) < 2 {
+			continue
+		}
+
+		pubKeyBytes, err := hex.DecodeString(parts[1])
+		if err != nil {
+			return false, fmt.Errorf("invalid hex in authorized_keys: %v", err)
+		}
+		if len(pubKeyBytes) != 32 {
+			return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
+		}
+		// Prevent man-in-the-middle key spoofing
+		if !bytes.Equal(presentedPubKey, pubKeyBytes) {
+			return false, fmt.Errorf("presented public key is not authorized")
+		}
+
+		if len(pubKeyBytes) != 32 {
+			return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
+		}
+		isValid := ed25519.Verify(presentedPubKey, sessionID, signature)
+		if !isValid {
+			return false, fmt.Errorf("couldnt verify the sig!")
+		}
+		return true, nil
+
+		/*if strings.ToLower(pkType) == "ecdsa" {
+			//only support compressed
+			if len(pubKeyBytes) < 33 && len(pubKeyBytes) > 67 {
+				return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
+			}
+			hash := sha256.Sum256(sessionID)
+			ecdsa.PublicKey
+			ecdsa.VerifyASN1(presentedPubKey, hash, signature)
+		}
+		*/
+
+	}
+
+	return false, fmt.Errorf("presented public key not found in authorized keys")
+}
+
+// VerifyPKIChain validates the client's X.509 certificate against the CA pool,
+// verifies the signature over the session ID, and returns the verified Common Name (Username).
+func VerifyPKIChain(certDer, signature, sessionID []byte, caPool *x509.CertPool) (string, error) {
+	// 1. Parse the DER-encoded X.509 certificate
+	cert, err := x509.ParseCertificate(certDer)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse client certificate: %w", err)
+	}
+
+	// 2. Verify the certificate chain against our Root CA Pool
+	opts := x509.VerifyOptions{
+		Roots:     caPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, // Enforce Client Auth usage
+	}
+	if _, err := cert.Verify(opts); err != nil {
+		return "", fmt.Errorf("certificate verification failed: %w", err)
+	}
+
+	// 3. Verify the client's signature over the Session ID
+	// We extract the public key directly from the verified certificate
+	switch pub := cert.PublicKey.(type) {
+	case ed25519.PublicKey:
+		if !ed25519.Verify(pub, sessionID, signature) {
+			return "", errors.New("invalid signature (proof of key ownership failed)")
+		}
+	case *ecdsa.PublicKey:
+		// Standard ECDSA (P-256 / P-384) verification
+		// Note: In production, hash the sessionID before verifying ECDSA
+		hash := sha256.Sum256(sessionID)
+		if !ecdsa.VerifyASN1(pub, hash[:], signature) {
+			return "", errors.New("invalid ECDSA signature")
+		}
+	default:
+		return "", errors.New("unsupported public key algorithm in certificate")
+	}
+
+	// 4. Return the Common Name (CN) as the authenticated username!
+	if cert.Subject.CommonName == "" {
+		return "", errors.New("certificate missing Common Name (username)")
+	}
+
+	return cert.Subject.CommonName, nil
+}
+
+// AuthenticatePAM hands the credentials directly to the Linux PAM stack.
+// It returns nil on success, or a descriptive OS auth error on failure.
+func AuthenticatePAM(username, password string) error {
+	// We use the "login" stack which naturally validates passwords, accounts, and lockout states.
+	t, err := pam.StartFunc("login", username, func(style pam.Style, msg string) (string, error) {
+		switch style {
+		case pam.PromptEchoOff: // PAM is asking for the password (hide echo)
+			return password, nil
+		case pam.PromptEchoOn: // PAM is asking for username
+			return username, nil
+		}
+		return "", nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// 1. Check password validity
+	if err = t.Authenticate(0); err != nil {
+		return err
+	}
+
+	// 2. Check account status (expired, locked, etc.)
+	return t.AcctMgmt(0)
+}
+
+// UserExists checks if a specific username exists on the host Linux operating system.
+// It is highly optimized, does not spawn external processes, and natively supports
+// both local passwd files and enterprise directory integrations (LDAP/AD) [1.1.2].
+func SysUserExists(username string) bool {
+	_, err := user.Lookup(username)
+	if err != nil {
+		// Go's os/user package returns an UnknownUserError if the user does not exist.
+		if _, ok := err.(user.UnknownUserError); ok {
+			return false
+		}
+		// A different system/resource error occurred (e.g., temporary system memory exhaustion)
+		log.Printf("[wireforge] System error looking up user %s: %v", username, err)
+		return false
+	}
+
+	return true
+}
