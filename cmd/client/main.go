@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,8 +13,6 @@ import (
 	"syscall"
 
 	"github.com/the-mhdi/shellforge/shellforge" // Replace with your actual module path
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 // =====================================================================
@@ -100,7 +96,7 @@ func runContainerMode(ctx context.Context, args []string, configOverride string)
 		return err
 	}
 
-	client, privateKey, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
 		return err
 	}
@@ -108,8 +104,17 @@ func runContainerMode(ctx context.Context, args []string, configOverride string)
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
 		return err
 	}
+	configDir := resolveConfigDir(configOverride)
+	signers, err := shellforge.LoadKeys(configDir, true)
+
+	if err != nil {
+		return err
+
+	}
+	primary := signers[0]
+
 	log.Printf("[CLI] Querying and running container: %s", name)
-	return client.GetAndRunContainer(name, privateKey)
+	return client.GetAndRunContainer(name, primary)
 }
 
 // ---------------------------------------------------------------------
@@ -121,7 +126,7 @@ func runContainersMode(ctx context.Context, args []string, configOverride string
 	}
 	hostport := withDefaultPort(args[0])
 
-	client, privateKey, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
 		return err
 	}
@@ -130,10 +135,18 @@ func runContainersMode(ctx context.Context, args []string, configOverride string
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
 		return err
 	}
+	configDir := resolveConfigDir(configOverride)
+	signers, err := shellforge.LoadKeys(configDir, true)
+
+	if err != nil {
+		return err
+
+	}
+	primary := signers[0]
 
 	// ASSUMPTION: adjust this call if your shellforge.Client method for
 	// listing containers has a different name/signature.
-	err = client.GetAndRunContainer("", privateKey)
+	err = client.GetAndRunContainer("", primary)
 	if err != nil {
 		return err
 	}
@@ -155,7 +168,7 @@ func runMakeMode(ctx context.Context, args []string, configOverride string) erro
 		return fmt.Errorf("unsupported env type %q", envType)
 	}
 
-	client, privateKey, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
 		return err
 	}
@@ -165,7 +178,16 @@ func runMakeMode(ctx context.Context, args []string, configOverride string) erro
 		return err
 	}
 	log.Printf("[CLI] Pre-creating %s environment named %s...", envType, requestedName)
-	return client.CreateENV(envType, requestedName, privateKey)
+
+	configDir := resolveConfigDir(configOverride)
+	signers, err := shellforge.LoadKeys(configDir, true)
+
+	if err != nil {
+		return err
+
+	}
+	primary := signers[0]
+	return client.CreateENV(envType, requestedName, primary)
 }
 
 // ---------------------------------------------------------------------
@@ -190,7 +212,7 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 		return err
 	}
 
-	client, _, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
 		return err
 	}
@@ -337,75 +359,17 @@ func resolveConfigDir(override string) string {
 // newClient resolves the config directory, loads the private key and
 // JSON config overrides, builds the shellforge.ClientConfig (including
 // the PrivateKey field your Connect() relies on), and constructs the client.
-func newClient(ctx context.Context, hostport, configOverride string) (*shellforge.Client, crypto.Signer, error) {
+func newClient(ctx context.Context, hostport, configOverride string) (*shellforge.Client, error) {
 	configDir := resolveConfigDir(configOverride)
 
-	privateKey, err := loadKey(configDir, false)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	conf, err := buildConfig(configDir)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	client := shellforge.NewClient(ctx, hostport, conf)
-	return client, privateKey, nil
-}
-
-// loadKey resolves <configDir>/id_ed25519. If configDir wasn't explicitly
-// given via -c and the default ~/.shellforge/id_ed25519 doesn't exist,
-// falls back to ~/.ssh/id_ed25519. If -c WAS given explicitly and the key
-// is missing there, that's a hard error rather than a silent fallback.
-func loadKey(configDir string, explicitOverride bool) (crypto.Signer, error) {
-	keyPath := os.Getenv("HOME") + "/.shellforge/id_ed25519"
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		if explicitOverride {
-			return nil, fmt.Errorf("no id_ed25519 key found in %s", configDir)
-		}
-		keyPath = os.Getenv("HOME") + "/.ssh/id_ed25519"
-	}
-	log.Printf("[CLI] Loading private key from: %s", keyPath)
-	return loadPrivateKeyPEM(keyPath)
-}
-
-// loadPrivateKeyPEM handles OpenSSH-format, PKCS#1, and PKCS#8 PEM keys,
-// prompting for a passphrase if the key is encrypted.
-func loadPrivateKeyPEM(path string) (crypto.Signer, error) {
-	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		log.Printf("[ERROR] faild to load config file")
+		client = shellforge.NewClient(ctx, hostport, nil)
 	}
 
-	key, err := ssh.ParseRawPrivateKey(raw)
-	if err != nil {
-		if _, ok := err.(*ssh.PassphraseMissingError); ok {
-			fmt.Fprint(os.Stderr, "Enter passphrase for key: ")
-			passBytes, readErr := term.ReadPassword(int(os.Stdin.Fd()))
-			fmt.Fprintln(os.Stderr)
-			if readErr != nil {
-				return nil, fmt.Errorf("failed to read passphrase: %w", readErr)
-			}
-			key, err = ssh.ParseRawPrivateKeyWithPassphrase(raw, passBytes)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
-	}
-
-	// x/crypto/ssh returns ed25519 keys as *ed25519.PrivateKey; normalize
-	// to the value type so downstream code can use a single, consistent
-	// type assertion against ed25519.PrivateKey.
-	if edPtr, ok := key.(*ed25519.PrivateKey); ok {
-		key = *edPtr
-	}
-
-	signer, ok := key.(crypto.Signer)
-	if !ok {
-		return nil, errors.New("private key does not support signing")
-	}
-	return signer, nil
+	return client, nil
 }
 
 // buildConfig builds the ClientConfig with defaults, then applies overrides

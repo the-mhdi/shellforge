@@ -20,16 +20,21 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 
 	"github.com/the-mhdi/wireforge/tcp" // Go's official chacha package
 )
+
+const CLIENT_VERSION_STRING string = "SHELLFORGE-CLIENT-v0.1.0"
 
 var ErrUnexpectedMsgType = errors.New("unexpected message type from server")
 
@@ -52,8 +57,8 @@ type ClientConfig struct {
 
 	ClientDir string //default ~/.shellforge //keys and clint config file here
 	//pki auth
-	ClientCert []byte          // DER-encoded client certificate
-	PrivateKey []crypto.Signer // e.g. *ecdsa.PrivateKey or ed25519.PrivateKey
+	ClientCert  []byte          // DER-encoded client certificate
+	PrivateKeys []crypto.Signer // e.g. *ecdsa.PrivateKey or ed25519.PrivateKey
 
 }
 
@@ -98,6 +103,34 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 
 	ctx, cancel := context.WithCancel(ctx)
 
+	if conf == nil {
+		home := os.Getenv("HOME")
+
+		conf = &ClientConfig{
+			PreferedKeyExAlgo:       "hybrid-x25519-mlkem768", // Default to high-security PQC
+			PreferedEncyptionCipher: "chacha20-poly1305",
+			ClientInitMessage:       CLIENT_VERSION_STRING,
+			ClientDir:               filepath.Join(home, ".shellforge"),
+		}
+	}
+
+	if conf.ClientDir == "" {
+		home := os.Getenv("HOME")
+		conf.ClientDir = filepath.Join(home, ".shellforge")
+	}
+
+	if conf.PreferedKeyExAlgo == "" {
+		conf.PreferedKeyExAlgo = "hybrid-x25519-mlkem768"
+	}
+
+	if conf.PreferedEncyptionCipher == "" {
+		conf.PreferedEncyptionCipher = "chacha20-poly1305"
+	}
+
+	if conf.ClientInitMessage == "" {
+		conf.ClientInitMessage = CLIENT_VERSION_STRING
+	}
+
 	return &Client{
 		DaemonAddr:            daemonAddr,
 		conf:                  conf,
@@ -112,6 +145,7 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 		cancel:                cancel,
 	}
 }
+
 func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 	conn, err := c.dialer.DialWithContext(ctx, c.DaemonAddr)
 
@@ -130,6 +164,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 	if err := tempSession.WritePacket(MsgClientInit, []byte(c.conf.ClientInitMessage)); err != nil {
 		return err
 	}
+
 	log.Printf("[Log] Client Init Sent: %s", string(c.InitMsg))
 
 	initRes, err := tempSession.ReadPacket()
@@ -681,11 +716,21 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 		//var aRes *AuthResponse
 		var authsuccess bool
 		authsuccess = false
-
+		pkCheck := false
+		pkiCheck := false
 	authLoop:
 		for {
-			if serverAuths&AuthMethodPublicKey != 0 {
-				for _, key := range c.conf.PrivateKey {
+			if serverAuths&AuthMethodPublicKey != 0 && pkCheck == false {
+				pkCheck = true
+				if len(c.conf.PrivateKeys) == 0 {
+					c.conf.PrivateKeys, err = loadKeys(c.conf.ClientDir, true)
+					if err != nil {
+						log.Println(err)
+						continue
+					}
+				}
+
+				for _, key := range c.conf.PrivateKeys {
 					if _, ok := key.(*ed25519.PrivateKey); ok {
 						log.Println("[Log] Executing Cryptographic Public Key Authentication...")
 						publicKey := key.Public().(ed25519.PublicKey)
@@ -727,9 +772,10 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 				}
 			}
 
-			if serverAuths&AuthMethodPKI != 0 {
+			if serverAuths&AuthMethodPKI != 0 && pkiCheck == false {
+				pkiCheck = true
 				log.Println("[Log] Executing PKI Certificate Handshake...")
-				for _, key := range c.conf.PrivateKey {
+				for _, key := range c.conf.PrivateKeys {
 					var signature []byte
 					if edKey, ok := key.(ed25519.PrivateKey); ok {
 						signature = ed25519.Sign(edKey, c.session.ID)
@@ -1433,4 +1479,125 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 	close(shellDone)
 
 	return nil
+}
+
+// loadKeys scans configDir for all usable private key files (any filename,
+// skipping *.pub and config.json), parses each one, and returns them
+// sorted by filename (so the result is deterministic and the "primary"
+// key, signers[0], can be controlled by renaming files). If configDir
+// wasn't explicitly given via -c and has no usable keys (or doesn't
+// exist), falls back to scanning ~/.ssh for the standard key filenames.
+// If -c WAS given explicitly and no usable key is found there, that's a
+// hard error rather than a silent fallback.
+func LoadKeys(keyDir string, fallback bool) ([]crypto.Signer, error) {
+	return loadKeys(keyDir, fallback)
+}
+func loadKeys(keyDir string, fallback bool) ([]crypto.Signer, error) {
+	signers, err := loadKeysFromDir(keyDir)
+	if err != nil {
+		log.Printf("cannot read key directory %s: %v", keyDir, err)
+	}
+
+	if len(signers) > 0 {
+		return signers, nil
+	}
+
+	if !fallback {
+		return nil, fmt.Errorf("load key failed")
+	}
+
+	log.Printf("Fall back to the standard ~/.ssh key filenames")
+
+	home := os.Getenv("HOME")
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		path := filepath.Join(home, ".ssh", name)
+		if _, statErr := os.Stat(path); statErr != nil {
+			continue
+		}
+		signer, loadErr := loadPrivateKeyPEM(path, name)
+		if loadErr != nil {
+			log.Printf("[CLI] skipping %s: %v", path, loadErr)
+			continue
+		}
+		log.Printf("[CLI] Loaded private key: %s", path)
+		signers = append(signers, signer)
+	}
+	if len(signers) == 0 {
+		return nil, errors.New("no usable private keys found in ~/.shellforge or ~/.ssh")
+	}
+	return signers, nil
+}
+
+// loadKeysFromDir parses every plausible key file directly inside dir.
+func loadKeysFromDir(dir string) ([]crypto.Signer, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasSuffix(n, ".pub") || n == "config.json" || strings.HasPrefix(n, ".") {
+			continue
+		}
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var signers []crypto.Signer
+	for _, n := range names {
+		path := filepath.Join(dir, n)
+		signer, err := loadPrivateKeyPEM(path, n)
+		if err != nil {
+			log.Printf("[CLI] skipping %s: %v", path, err)
+			continue
+		}
+		log.Printf("[CLI] Loaded private key: %s", path)
+		signers = append(signers, signer)
+	}
+	return signers, nil
+}
+
+// loadPrivateKeyPEM handles OpenSSH-format, PKCS#1, and PKCS#8 PEM keys,
+// prompting for a passphrase if the key is encrypted.
+func loadPrivateKeyPEM(path string, name string) (crypto.Signer, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := ssh.ParseRawPrivateKey(raw)
+	if err != nil {
+		if _, ok := err.(*ssh.PassphraseMissingError); ok {
+
+			fmt.Fprint(os.Stderr, "Enter passphrase for key(", name, "):")
+
+			passBytes, readErr := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Fprintln(os.Stderr)
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read passphrase: %w", readErr)
+			}
+			key, err = ssh.ParseRawPrivateKeyWithPassphrase(raw, passBytes)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse private key: %w", err)
+		}
+	}
+
+	// x/crypto/ssh returns ed25519 keys as *ed25519.PrivateKey; normalize
+	// to the value type so downstream code can use a single, consistent
+	// type assertion against ed25519.PrivateKey.
+	if edPtr, ok := key.(*ed25519.PrivateKey); ok {
+		key = *edPtr
+	}
+
+	signer, ok := key.(crypto.Signer)
+	if !ok {
+		return nil, errors.New("private key does not support signing")
+	}
+	return signer, nil
 }

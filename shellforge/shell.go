@@ -48,24 +48,26 @@ type WindowResize struct {
 }
 
 // RunInteractiveShell spawns a shell and pipes it to our multiplexed Channel.
-func RunInteractiveShell(ctx context.Context, shell *ShellRequest, pipe io.ReadWriteCloser, rows, cols uint16) error {
+func RunInteractiveShell(ctx context.Context, shellReq *ShellRequest, pipe io.ReadWriteCloser, rows, cols uint16) error {
 
-	if _, err := exec.LookPath(string(shell.Shell)); err != nil {
-		shell.Shell = []byte("/bin/bash")
+	var shell string
+	shell = "/bin/bash"
+	if _, err := exec.LookPath(string(shellReq.Shell)); err != nil {
+		shell = "/bin/bash"
 		// If bash isn't installed, fall back to sh
-		if _, err := exec.LookPath(string(shell.Shell)); err != nil {
-			shell.Shell = []byte("/bin/sh")
+		if _, err := exec.LookPath(string(shellReq.Shell)); err != nil {
+			shell = "/bin/sh"
 		}
 
 	}
-	cmd := exec.CommandContext(ctx, string(shell.Shell))
+	cmd := exec.CommandContext(ctx, shell)
 
 	// Default to inheriting the daemon's environment
 	cmdEnv := os.Environ()
 
 	// 1. INJECT SYSTEM CREDENTIALS & SANITIZE ENVIRONMENT
-	if runtime.GOOS != "windows" && string(shell.User) != "" {
-		u, err := user.Lookup(string(shell.User))
+	if runtime.GOOS != "windows" && string(shellReq.User) != "" {
+		u, err := user.Lookup(string(shellReq.User))
 		if err != nil {
 			return fmt.Errorf("user system lookup failed: %w", err)
 		}
@@ -79,13 +81,13 @@ func RunInteractiveShell(ctx context.Context, shell *ShellRequest, pipe io.ReadW
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: cred,
 		}
-
+		cmd.Dir = u.HomeDir
 		// FIX: Sanitize the environment so the shell doesn't look at /root!
 		cmdEnv = sanitizeEnv(cmdEnv, map[string]string{
-			"HOME":    u.HomeDir,           // e.g. "/home/alice"
-			"USER":    u.Username,          // e.g. "alice"
-			"LOGNAME": u.Username,          // e.g. "alice"
-			"SHELL":   string(shell.Shell), // e.g. "/bin/bash"
+			"HOME":    u.HomeDir,  // e.g. "/home/alice"
+			"USER":    u.Username, // e.g. "alice"
+			"LOGNAME": u.Username, // e.g. "alice"
+			"SHELL":   shell,      // e.g. "/bin/bash"
 		})
 	}
 
