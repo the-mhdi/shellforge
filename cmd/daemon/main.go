@@ -80,7 +80,6 @@ func main() {
 }
 
 func runDaemon(listenAddr, ENVsJsonConfDir, configPath string) {
-	log.Printf("[CLI] Starting Shellforge Daemon")
 
 	// 4. defalut Construct the final shellforge.DaemonConfig
 	conf := shellforge.DaemonConfig{

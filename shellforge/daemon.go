@@ -14,14 +14,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/atomic"
 
+	"github.com/creack/pty"
 	"github.com/the-mhdi/wireforge/tcp"
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -68,9 +72,10 @@ type Daemon struct {
 
 	CAPool *x509.CertPool // Loaded on startup
 
-	State *DaemonState
-
 	DB *DB // Database for tracking allowed keys and active temp users
+
+	AllowedKeys map[string]AccessKeyRecord
+	State       *DaemonState
 
 	ctx    context.Context
 	Cancel context.CancelFunc
@@ -374,6 +379,7 @@ func (d *Daemon) listen() {
 			if err != nil {
 				return
 			}
+
 			if !ed25519.Verify(eReq.PublicKey, session.ID, eReq.Signature) {
 				log.Printf("cant verify sig")
 				session.WritePacket(MsgServerInvalidSignature, nil)
@@ -386,14 +392,16 @@ func (d *Daemon) listen() {
 				return
 			}
 
-			if !d.DB.HasActiveEnv(string(eReq.PublicKey), "container") || !d.DB.IsEligibleKey(string(eReq.PublicKey)) {
-				log.Printf("no container fot this key ")
+			pubKeyHex := hex.EncodeToString(eReq.PublicKey)
+
+			if !d.DB.HasActiveEnv(pubKeyHex, "container") || !d.DB.IsEligibleKey(pubKeyHex) {
+				log.Printf("no container fot this key %s", string(eReq.PublicKey))
 				session.WritePacket(MsgServerNoContainer, nil)
 				return
 			}
 
 			if eReq.UserRequestedName == nil || eReq.UserRequestedNameLen == 0 {
-				envs, err := d.DB.GetEnvsByType(string(eReq.PublicKey), "container")
+				envs, err := d.DB.GetEnvsByType(pubKeyHex, "container")
 				if err != nil {
 					log.Printf("cant get container list, %v", err)
 					session.WritePacket(MsgServerNoContainer, nil)
@@ -425,7 +433,7 @@ func (d *Daemon) listen() {
 				}
 
 			}
-			env, err := d.DB.GetENVByUserReqestedName(string(eReq.UserRequestedName), string(eReq.PublicKey))
+			env, err := d.DB.GetENVByUserReqestedName(string(eReq.UserRequestedName), pubKeyHex)
 
 			if err == nil && env != nil {
 				chanID := session.IncrementChannelID()
@@ -433,26 +441,35 @@ func (d *Daemon) listen() {
 				log.Printf("New Channel for container Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
 
 				pipeStream := NewPipe(chanID, session)
+				session.AddActiveChannel(chanID, pipeStream)
 
+				runCh := make(chan struct{}, 1)
 				go func() {
 					defer session.DeleteActiveChannel(chanID)
 					defer pipeStream.Close()
-					err := d.RunContainer(connCtx, env.Name, env.ImageName, env.Setting.MemoryLimit, env.Setting.CPULimit, env.Setting.GPULimit, 24, 80, pipeStream)
+
+					err := d.RunContainer(connCtx, runCh, env.Name, env.ImageName, env.Setting.MemoryLimit, env.Setting.CPULimit, env.Setting.GPULimit, 24, 80, pipeStream)
 					if err != nil {
+						log.Println(err)
 						return
-					}
-					srr := &ShellRequestResponse{
-						RequestID: eReq.RequestID, // Matches the client's request
-						ChannelID: chanID,         // ASSIGNED BY THE SERVER!
-						Success:   true,
 					}
 
-					err = session.WritePacket(MsgServerShellReqResponse, srr.Marshal())
-					if err != nil {
-						return
-					}
-					log.Printf("container running")
 				}()
+
+				<-runCh
+
+				srr := &ShellRequestResponse{
+					RequestID: eReq.RequestID, // Matches the client's request
+					ChannelID: chanID,         // ASSIGNED BY THE SERVER!
+					Success:   true,
+				}
+
+				err = session.WritePacket(MsgServerShellReqResponse, srr.Marshal())
+				if err != nil {
+					return
+				}
+
+				log.Printf("container running")
 
 				d.ContainerLoop(connCtx, session)
 			}
@@ -1233,64 +1250,60 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *PipeStream, sessionID
 		return nil, err
 	}
 
-	if (record.SysUsersCount+record.ContaintersCount+record.NamespacesCount) >= record.MaxSessions && record.MaxSessions != 0 {
-		log.Printf("Key has reached maximum active sessions: %s", pubKeyHex)
-		return nil, ErrMaxActiveSessions
-	}
-
 	requestedType := strings.ToLower(strings.TrimSpace(string(eReq.AccessType)))
 
 	switch requestedType {
 	case "system-user":
-		//IM_TO_DO: sever should have a type of message that when is recieved by client the client is
-		// asked to type a string(passwd) or sth and that would be sent to the server
-		if SysUserExists(string(eReq.UserRequestedName)) {
-			return nil, errors.New("user already exists. Skipping creation.")
-		}
-		tempUser := GenerateTempUsername()
-		err = CreateSystemUser(tempUser, envConfig.Setting.GroupName, envConfig.Setting.Shell)
-		if err != nil {
-			log.Printf("Failed to create Ephemeral system user: %v", err)
-			//session.WritePacket(MsgServerFailedToCreateTempSysUser, nil)
-			return nil, err
-		}
-		log.Printf("Successfully created Ephemeral system User: %s", tempUser)
-		var expiresAt time.Time
-		duration, err := parseDurationWithDays(envConfig.LifeSpan)
+		/*
+			//IM_TO_DO: sever should have a type of message that when is recieved by client the client is
+			// asked to type a string(passwd) or sth and that would be sent to the server
+			if SysUserExists(string(eReq.UserRequestedName)) {
+				return nil, errors.New("user already exists. Skipping creation.")
+			}
+			tempUser := GenerateTempUsername()
+			err = CreateSystemUser(tempUser, envConfig.Setting.GroupName, envConfig.Setting.Shell)
+			if err != nil {
+				log.Printf("Failed to create Ephemeral system user: %v", err)
+				//session.WritePacket(MsgServerFailedToCreateTempSysUser, nil)
+				return nil, err
+			}
+			log.Printf("Successfully created Ephemeral system User: %s", tempUser)
+			var expiresAt time.Time
+			duration, err := parseDurationWithDays(envConfig.LifeSpan)
 
-		if err != nil {
-			DeleteSystemUser(tempUser)
-			return nil, err
-		}
+			if err != nil {
+				DeleteSystemUser(tempUser)
+				return nil, err
+			}
 
-		if duration > 0 {
-			expiresAt = time.Now().Add(duration)
-		}
+			if duration > 0 {
+				expiresAt = time.Now().Add(duration)
+			}
 
-		// ====================================================
-		// WRITE TO DB: Track the active container environment! [1, 3]
-		// ====================================================
-		activeEnv := &ENVs{
-			PubKey:            pubKeyHex,
-			EnvType:           "system-user",
-			Name:              tempUser,
-			ImageName:         "",
-			UserRequestedName: string(eReq.UserRequestedName),
-			Setting:           envConfig.Setting, // COPY THE SETTINGS DIRECTLY! [1]
-			ExpiresAt:         expiresAt,
-			CreatedAt:         time.Now(),
-			SurviveReboot:     envConfig.Setting.SurviveReboot,
-		}
+			// ====================================================
+			// WRITE TO DB: Track the active container environment! [1, 3]
+			// ====================================================
+			activeEnv := &ENVs{
+				PubKey:            pubKeyHex,
+				EnvType:           "system-user",
+				Name:              tempUser,
+				ImageName:         "",
+				UserRequestedName: string(eReq.UserRequestedName),
+				Setting:           envConfig.Setting, // COPY THE SETTINGS DIRECTLY! [1]
+				ExpiresAt:         expiresAt,
+				CreatedAt:         time.Now(),
+				SurviveReboot:     envConfig.Setting.SurviveReboot,
+			}
 
-		err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
-		if err != nil {
-			DeleteSystemUser(tempUser)
-			return nil, err
-		}
+			err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
+			if err != nil {
+				DeleteSystemUser(tempUser)
+				return nil, err
+			}
 
-		return activeEnv, nil
-		//session.WritePacket(MsgServerTempShellResponse)
-
+			return activeEnv, nil
+			//session.WritePacket(MsgServerTempShellResponse)
+		*/
 	case "container": //use libcontainer, https://github.com/opencontainers/runc/tree/main/libcontainer
 
 		if record.MaxContainers > 0 && record.ContaintersCount >= record.MaxContainers {
@@ -1305,25 +1318,32 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *PipeStream, sessionID
 			imageName, err = BuildDockerfileOnDemand(ctx, p, envConfig.Setting.DockerfilePath, pubKeyHex)
 			if err != nil {
 				log.Printf("Failed to compile custom Dockerfile: %v", err)
-
 				return nil, err
 			}
 		}
 
 		log.Printf("image built: %s", imageName)
 
-		containerName, err = CreateContainer(ctx, pubKeyHex, imageName, envConfig.Setting.MemoryLimit, envConfig.Setting.CPULimit, envConfig.Setting.GPULimit)
+		containerName, err = CreateContainer(ctx, p, pubKeyHex, imageName, envConfig.Setting.MemoryLimit, envConfig.Setting.CPULimit, envConfig.Setting.GPULimit)
 		if err != nil {
+			if containerName != "" {
+				KillAndRemoveContainer(ctx, containerName)
+			}
+
+			DeleteContainerImage(ctx, imageName)
+
 			return nil, err
 		}
+
 		log.Printf("container created: %s", containerName)
 
 		// Calculate absolute expiration time
 		var expiresAt time.Time
-		duration, err := parseDurationWithDays(envConfig.LifeSpan)
+		duration, err := parseDurationWithDays(record.ExpiresAfter.String())
 
 		if err != nil {
 			KillAndRemoveContainer(ctx, containerName)
+			DeleteContainerImage(ctx, imageName)
 			return nil, err
 		}
 
@@ -1345,9 +1365,34 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *PipeStream, sessionID
 			CreatedAt:         time.Now(),
 			SurviveReboot:     envConfig.Setting.SurviveReboot,
 		}
+
+		fmt.Printf(
+			"container Created{\n"+
+				"  PubKey: %s\n"+
+				"  EnvType: container\n"+
+				"  Name: %s\n"+
+				"  ImageName: %s\n"+
+				"  UserRequestedName: %s\n"+
+				"  Setting: %v\n"+
+				"  ExpiresAt:%s"+
+				"  SurviveReboot: %t\n"+
+				"}\n",
+			pubKeyHex,
+			containerName,
+			imageName,
+			string(eReq.UserRequestedName),
+			envConfig.Setting,
+			expiresAt,
+			envConfig.Setting.SurviveReboot,
+		)
+
 		err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
 		if err != nil {
+			if err == ErrDuplicateEnvName {
+				return nil, err
+			}
 			KillAndRemoveContainer(ctx, containerName)
+			DeleteContainerImage(ctx, imageName)
 			return nil, err
 		}
 		return activeEnv, nil
@@ -1395,31 +1440,26 @@ func (d *Daemon) ValidateENVRequest(eReq *EnvRequest, record *AccessKeyRecord) (
 		return nil, fmt.Errorf("environment type %q is not authorized for this key", string(eReq.AccessType))
 	}
 
-	// 6. Verify login limits for this specific environment type [2]
-	// (Note: MaxLogins <= 0 or -1 is treated as unlimited)
-	if matchedEnv.MaxLogins > 0 && record.LoginsUsed >= matchedEnv.MaxLogins {
-		return nil, fmt.Errorf("login limit reached for environment %s (%d/%d used)",
-			matchedEnv.Type, record.LoginsUsed, matchedEnv.MaxLogins)
-	}
-
 	// 7. Enforce dynamic resource limit thresholds [2]
 	switch requestedType {
-	case "system-user":
+	/*	case "system-user":
 		if record.MaxUsers > 0 && record.SysUsersCount >= record.MaxUsers {
 			return nil, fmt.Errorf("maximum active system users limit reached (%d/%d)",
 				record.SysUsersCount, record.MaxUsers)
-		}
+		}*/
 	case "container":
 		// Preserves your exact "ContaintersCount" struct spelling to prevent compilation errors
 		if record.MaxContainers > 0 && record.ContaintersCount >= record.MaxContainers {
 			return nil, fmt.Errorf("maximum active containers limit reached (%d/%d)",
 				record.ContaintersCount, record.MaxContainers)
 		}
-	case "hostsharednamespace", "jailed":
-		if record.MaxNamespaces > 0 && record.NamespacesCount >= record.MaxNamespaces {
-			return nil, fmt.Errorf("maximum active jailed environments limit reached (%d/%d)",
-				record.NamespacesCount, record.MaxNamespaces)
-		}
+		/*
+			case "hostsharednamespace", "jailed":
+				if record.MaxNamespaces > 0 && record.NamespacesCount >= record.MaxNamespaces {
+					return nil, fmt.Errorf("maximum active jailed environments limit reached (%d/%d)",
+						record.NamespacesCount, record.MaxNamespaces)
+				}
+		*/
 	}
 
 	return matchedEnv, nil
@@ -1428,7 +1468,7 @@ func (d *Daemon) ValidateENVRequest(eReq *EnvRequest, record *AccessKeyRecord) (
 func Start(conf DaemonConfig) {
 	log.Printf("[CLI] Starting shellforge Daemon")
 	// Open the SQLite database
-	dbdir := "/etc/shellforge/shf.db"
+	dbdir := "/etc/shellforge/"
 	if conf.DatabaseDir != "" {
 		dbdir = conf.DatabaseDir
 	}
@@ -1437,11 +1477,15 @@ func Start(conf DaemonConfig) {
 	if err != nil {
 		log.Fatalf("Failed to open SQLite database: %v", err)
 	}
+
+	log.Printf(" SQLite database Loaded")
+
 	if conf.EnvironmentsJsonConfig != "" {
 		_, err := db.LoadAccessKeysConf(conf.EnvironmentsJsonConfig)
 		if err != nil {
 			log.Fatalf("Failed to open parse EnvironmentsJsonConfig: %v", err)
 		}
+		log.Printf(" access keys database Loaded")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1566,4 +1610,96 @@ func randomBytes(length int) []byte {
 		panic("PANIC! crypto/rand failed, FATAL FLAW") // If the OS crypto fails, the server MUST panic.
 	}
 	return b
+}
+
+// RunPodmanContainer dynamically starts a fresh container or resumes an existing stopped one [1, 2, 3].
+func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, containerName, imageName, memoryLimit string, cpuLimit float64, gpuLimit string, rows, cols uint16, ch io.ReadWriter) error {
+	log.Printf("[Container] running as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
+	// 1. Check if a container with this name already exists on the host [1, 3]
+	// 'podman container exists' returns exit code 0 if it exists, and non-zero if it doesn't.
+	existsCmd := exec.Command("podman", "container", "exists", containerName)
+	containerExists := existsCmd.Run() == nil
+
+	var cmd *exec.Cmd
+
+	if containerExists {
+		// --- RESUME EXISTING CONTAINER --- [2, 3]
+		// The container already exists from a previous session.
+		// We start and attach (-a -i) directly to it. All previous files and states are intact!
+		log.Printf("[Container] Resuming existing stopped container: %s", containerName)
+		args := []string{"start", "-a", "-i", containerName}
+		cmd = exec.CommandContext(ctx, "podman", args...)
+	} else {
+		// --- CREATE FRESH CONTAINER --- [2]
+		// First-time login. We run a new container.
+		// NOTE: We intentionally OMIT the "--rm" flag so the container persists when we exit!
+		log.Printf("[Container] Creating fresh persistent container: %s", containerName)
+		args := []string{
+			"run", "-it",
+			"--name", containerName,
+			"--pull=never",
+			fmt.Sprintf("--memory=%s", memoryLimit),
+			fmt.Sprintf("--cpus=%f", cpuLimit),
+		}
+
+		//	var validGPUDevice = regexp.MustCompile(`^(all|[0-9]+(,[0-9]+)*)$`)
+		//	if gpuLimit != "" {
+		//		cleaned := strings.Trim(gpuLimit, `"' `) // strip stray quotes/whitespace
+		//		if !validGPUDevice.MatchString(cleaned) {
+		//			return fmt.Errorf("invalid gpuLimit value %q: expected \"all\" or comma-separated device indices", gpuLimit)
+		//		}
+		//		args = append(args, "--device", fmt.Sprintf("nvidia.com/gpu=%s", cleaned))
+		//
+		//	}
+
+		imageName := fmt.Sprintf("localhost/%s", imageName)
+		args = append(args, imageName)
+
+		listCmd := exec.Command("podman", "images", "--format", "{{.Repository}}:{{.Tag}}")
+		out, _ := listCmd.CombinedOutput()
+		log.Printf("[Container] Visible images at run-time: %s", out)
+
+		cmd = exec.CommandContext(ctx, "podman", args...)
+	}
+
+	// 2. Spawn the container inside the PTY [3]
+	ptyFd, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
+	if err != nil {
+		return err
+	}
+
+	defer ptyFd.Close()
+
+	if pipe, ok := ch.(*PipeStream); ok {
+		pipe.SetPTY(ptyFd)
+		defer pipe.SetPTY(nil)
+	}
+
+	log.Printf("[Container] pty stared: %s", containerName)
+	close(run) //signal run
+
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(ptyFd, ch)
+		errCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(ch, ptyFd)
+		errCh <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Gracefully stop the container instead of killing it,
+		// allowing internal database/file writes to finish cleanly [4].
+		log.Printf("[Container] Gracefully stopping container %s...", containerName)
+		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
+		return ctx.Err()
+	case <-errCh:
+		// If connection drops, send SIGTERM and give it 5 seconds to stop gracefully [4]
+		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
+		log.Printf("[Container] Gracefully stopping container %s...", containerName)
+	}
+
+	return cmd.Wait()
 }

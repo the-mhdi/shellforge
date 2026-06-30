@@ -1,15 +1,13 @@
 package shellforge
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-
-	"github.com/creack/pty"
 )
 
 const IMAGE_NAME_PREFIX string = "shf_image_"
@@ -133,18 +131,17 @@ func (res *ContainersListResponse) Marshal() []byte {
 // It runs once (usually when an administrator registers a new user key or updates the Dockerfile configuration).
 // BuildDockerfileOnDemand compiles a local Dockerfile if it hasn't been built yet [2].
 func BuildDockerfileOnDemand(ctx context.Context, pipe *PipeStream, dockerfilePath, pubKeyHex string) (string, error) {
+	log.Printf("[Container] running as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
 	if dockerfilePath == "" {
 		return "", nil
 	}
 	imageName := fmt.Sprintf("%s%s", IMAGE_NAME_PREFIX, pubKeyHex[:8])
+
 	// 1. FAST PATH: Check if the compiled image already exists in local storage.
-	// 'podman image exists' returns exit code 0 if found, and non-zero if not [3].
 	existsCmd := exec.CommandContext(ctx, "podman", "image", "exists", imageName)
 	if existsCmd.Run() == nil {
-
 		log.Printf("[Container] Image %s already exists. Skipping build.", imageName)
-
-		return "", nil // Bypasses the build entirely!
+		return imageName, nil // <-- return the name, not ""
 	}
 
 	// 2. Verification: Ensure the Dockerfile actually exists on disk before starting
@@ -154,116 +151,71 @@ func BuildDockerfileOnDemand(ctx context.Context, pipe *PipeStream, dockerfilePa
 
 	log.Printf("[Container] Compiling custom Dockerfile at %s to tag %s...", dockerfilePath, imageName)
 	cmd := exec.CommandContext(ctx, "podman", "build", "-t", imageName, dockerfilePath)
-
 	cmd.Stdout = pipe
 	cmd.Stderr = pipe
-
-	return imageName, cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("podman build failed: %w", err)
+	}
+	return imageName, nil
 }
 
 // CreatePodmanContainer parses the configuration and pre-stages the container on disk.
 // It uses "podman create" instead of "run" so that the container is registered
 // but remains in a "stopped" state until the user actually logs in [1.2.2].
-func CreateContainer(ctx context.Context, pubKeyHex, imageName, memoryLimit string, cpuLimit float64, gpuLimit string) (string, error) {
-
+func CreateContainer(ctx context.Context, pipe *PipeStream, pubKeyHex, imageName, memoryLimit string, cpuLimit float64, gpuLimit string) (string, error) {
+	log.Printf("[Container] running as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
 	containerName := fmt.Sprintf("%s%s", CONTAINER_NAME_PREFIX, pubKeyHex[:8])
+
 	// 1. Check if the container already exists on the host [1.2.3]
 	existsCmd := exec.Command("podman", "container", "exists", containerName)
 	if existsCmd.Run() == nil {
-		return "", nil // Already created, nothing to do!
+		return containerName, nil // Already created, nothing to do!
 	}
 
 	// 2. Prepare the creation arguments (No "-it" needed for raw creation)
 	args := []string{
 		"create", "-it", // Keep STDIN open even if not attached
 		"--name", containerName,
-		fmt.Sprintf("--memory=%s", memoryLimit),
-		fmt.Sprintf("--cpus=%f", cpuLimit),
 	}
 
-	if gpuLimit != "" {
-		args = append(args, "--gpus", gpuLimit)
+	// Only pass --memory if a non-empty value was actually provided.
+	// "--memory=" (empty) is rejected by podman as an invalid value.
+	if memoryLimit != "" {
+		args = append(args, fmt.Sprintf("--memory=%s", memoryLimit))
 	}
+
+	// Only pass --cpus if a sane positive value was provided.
+	// "--cpus=0.000000" is rejected by podman.
+	if cpuLimit > 0 {
+		args = append(args, fmt.Sprintf("--cpus=%f", cpuLimit))
+	}
+
+	//	var validGPUDevice = regexp.MustCompile(`^(all|[0-9]+(,[0-9]+)*)$`)
+	//
+	//	// podman doesn't support docker's "--gpus" flag — it uses CDI device specs instead.
+	//	// e.g. "--device nvidia.com/gpu=all" or "--device nvidia.com/gpu=0"
+	//	if gpuLimit != "" {
+	//		cleaned := strings.Trim(gpuLimit, `"' `) // strip stray quotes/whitespace
+	//		if !validGPUDevice.MatchString(cleaned) {
+	//			return "", fmt.Errorf("invalid gpuLimit value %q: expected \"all\" or comma-separated device indices", gpuLimit)
+	//		}
+	//		args = append(args, "--device", fmt.Sprintf("nvidia.com/gpu=%s", cleaned))
+	//
+	//	}
 
 	args = append(args, imageName)
 
 	// 3. Create the container (This allocates the persistent filesystem on disk!)
+	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "podman", args...)
-	return containerName, cmd.Run()
-}
 
-// RunPodmanContainer dynamically starts a fresh container or resumes an existing stopped one [1, 2, 3].
-func (d *Daemon) RunContainer(ctx context.Context, containerName, imageName, memoryLimit string, cpuLimit float64, gpuLimit string, rows, cols uint16, ch io.ReadWriter) error {
-
-	// 1. Check if a container with this name already exists on the host [1, 3]
-	// 'podman container exists' returns exit code 0 if it exists, and non-zero if it doesn't.
-	existsCmd := exec.Command("podman", "container", "exists", containerName)
-	containerExists := existsCmd.Run() == nil
-
-	var cmd *exec.Cmd
-
-	if containerExists {
-		// --- RESUME EXISTING CONTAINER --- [2, 3]
-		// The container already exists from a previous session.
-		// We start and attach (-a -i) directly to it. All previous files and states are intact!
-		log.Printf("[Container] Resuming existing stopped container: %s", containerName)
-		args := []string{"start", "-a", "-i", containerName}
-		cmd = exec.CommandContext(ctx, "podman", args...)
-	} else {
-		// --- CREATE FRESH CONTAINER --- [2]
-		// First-time login. We run a new container.
-		// NOTE: We intentionally OMIT the "--rm" flag so the container persists when we exit!
-		log.Printf("[Container] Creating fresh persistent container: %s", containerName)
-		args := []string{
-			"run", "-it",
-			"--name", containerName,
-			fmt.Sprintf("--memory=%s", memoryLimit),
-			fmt.Sprintf("--cpus=%f", cpuLimit),
-		}
-
-		if gpuLimit != "" {
-			args = append(args, "--gpus", gpuLimit)
-		}
-
-		args = append(args, imageName)
-		cmd = exec.CommandContext(ctx, "podman", args...)
+	cmd.Stdout = pipe
+	cmd.Stderr = pipe
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return containerName, fmt.Errorf("podman create failed: %w (stderr: %s)", err, stderr.String())
 	}
-
-	// 2. Spawn the container inside the PTY [3]
-	ptyFd, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
-	if err != nil {
-		return err
-	}
-	defer ptyFd.Close()
-
-	if pipe, ok := ch.(*PipeStream); ok {
-		pipe.SetPTY(ptyFd)
-		defer pipe.SetPTY(nil)
-	}
-
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(ptyFd, ch)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(ch, ptyFd)
-		errCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
-		// Gracefully stop the container instead of killing it,
-		// allowing internal database/file writes to finish cleanly [4].
-		log.Printf("[Container] Gracefully stopping container %s...", containerName)
-		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
-		return ctx.Err()
-	case <-errCh:
-		// If connection drops, send SIGTERM and give it 5 seconds to stop gracefully [4]
-		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
-	}
-
-	return cmd.Wait()
+	return containerName, nil
 }
 
 // KillAndRemoveContainer forcefully terminates a running container (SIGKILL)

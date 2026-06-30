@@ -1041,7 +1041,7 @@ func (c *Client) eventLoop() {
 					"  UserRequestedName: %s\n"+
 					"  Name: %s\n"+
 					"  Success: %v\n"+
-					"}",
+					"}\n",
 				ec.RequestID,
 				ec.PublicKey,
 				string(ec.AccessType),
