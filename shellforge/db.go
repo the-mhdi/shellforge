@@ -2,8 +2,6 @@ package shellforge
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,35 +11,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
-type AccessKeyRecord struct {
-	PubKey           string         `json:"pubkey"`
-	KeyExpiresAfter  time.Duration  `json:"key_expires_afer"` // Nanoseconds in DB
-	Environment      EnvConfigSlice `json:"environment"`      // Auto-serialized JSON
-	MaxSessions      int            `json:"max_sessions,omitempty"`
-	MaxContainers    int            `json:"max_containers,omitempty"`
-	MaxUsers         int            `json:"max_users,omitempty"`
-	MaxNamespaces    int            `json:"max_namespaces,omitempty"`
-	LoginsUsed       int
-	SysUsersCount    int
-	ContaintersCount int
-	NamespacesCount  int
-	CreatedAt        time.Time
-}
+// =====================================================================
+// CORE TYPES
+// =====================================================================
 
 type EnvConfigSlice []EnvConfig
 
 type EnvConfig struct {
-	Type       string     `json:"type"` // "container", "systemUser", or "HostSharedNamespace"
-	Setting    EnvSetting `json:"setting"`
-	MaxLogins  int        `json:"max_logins,omitempty"`
-	LifeSpan   string     `json:"life_span"` // Raw string (e.g., "2h", "0")
-	Timeout    string     `json:"timeout,omitempty"`
-	OneTimeUse bool       `json:"one_time_use,omitempty"`
+	Type    string     `json:"type"` // "container" (only supported type for now)
+	Setting EnvSetting `json:"setting"`
 }
 
 type EnvSetting struct {
@@ -50,712 +32,602 @@ type EnvSetting struct {
 	MemoryLimit    string  `json:"memory_limit,omitempty"`
 	CPULimit       float64 `json:"cpu_limit,omitempty"`
 	GPULimit       string  `json:"gpu_limit,omitempty"`
-
-	// System User Configuration
-	Shell     string `json:"shell,omitempty"`
-	HomeDir   string `json:"HomeDir,omitempty"`
-	GroupName string `json:"groupname,omitempty"`
-
-	// Host Shared Namespace Configuration
-	Mount []string `json:"mount,omitempty"`
-
-	SurviveReboot bool `json:"survive_reboot,omitempty"`
+	SurviveReboot  bool    `json:"survive_reboot,omitempty"`
+	Shell          string
 }
 
+// AccessKeyRecord represents one entry in keys.json (the allow-list config).
+type AccessKeyRecord struct {
+	IsActive         bool           `json:"active"`
+	SurviveReboot    bool           `json:"survive_reboot,omitempty"`
+	PubKeys          []string       `json:"pubkey"`
+	KeyExpiresAfter  time.Duration  `json:"key_expires_afer"` // Nanoseconds in DB
+	Environment      EnvConfigSlice `json:"environment"`
+	MaxContainers    int            `json:"max_containers,omitempty"`
+	ContaintersCount int            `json:"containters_count,omitempty"`
+	CreatedAt        time.Time      `json:"created_at,omitempty"`
+	ExpiresAfter     time.Duration  `json:"expires_after,omitempty"`
+}
+
+// ENVs represents one currently-running/created environment in envs.json.
 type ENVs struct {
-	ID                string
-	PubKey            string `json:"pubkey"`
-	EnvType           string `json:"env_type"` // "container", "systemUser", "HostSharedNamespace"
-	Name              string `json:"name"`     // container name, system username, jail directory name
-	ImageName         string // if EnvType = container
-	UserRequestedName string
-	Setting           EnvSetting `json:"setting"` // State of the configured environment
-	ExpiresAt         time.Time
-	CreatedAt         time.Time
-	SurviveReboot     bool `json:"survive_reboot,omitempty"`
+	ID                string     `json:"id"`
+	PubKey            string     `json:"pubkey"`
+	EnvType           string     `json:"env_type"` // "container" (only supported type for now)
+	Name              string     `json:"name"`
+	ImageName         string     `json:"image_name,omitempty"`
+	UserRequestedName string     `json:"user_requested_name,omitempty"`
+	Setting           EnvSetting `json:"setting"`
+	ExpiresAt         time.Time  `json:"expires_at"`
+	CreatedAt         time.Time  `json:"created_at"`
+	SurviveReboot     bool       `json:"survive_reboot,omitempty"`
 }
 
+var (
+	ErrDuplicateEnvName = errors.New("an active environment with this name already exists for this key")
+)
+
 // =====================================================================
-// ENTERPRISE JSON SERIALIZATION HELPERS
+// DB — JSON FILE BACKED STORE
 // =====================================================================
+//
+// Two flat JSON files act as our "tables":
+//   <dir>/keys.json  -> []AccessKeyRecord  (allow-listed keys + their limits)
+//   <dir>/envs.json  -> []ENVs             (actively created environments)
+//
+// A single RWMutex guards in-memory state; every mutation is flushed to
+// disk atomically (write to temp file, then rename) so a crash mid-write
+// can never corrupt the JSON.
 
 type DB struct {
-	db *sql.DB
+	mu sync.RWMutex
+
+	keysPath string
+	envsPath string
+
+	keys []AccessKeyRecord
+	envs []ENVs
 }
 
+// OpenDB takes a directory path (e.g. "/var/lib/shellforge") and ensures
+// keys.json / envs.json exist inside it, loading them into memory.
 func OpenDB(path string) (*DB, error) {
-	dir := filepath.Dir(path)
-
-	// os.MkdirAll is safe: it recursively creates all missing folders with 0755 permissions.
-	// If the folders already exist, it instantly does nothing and returns nil.
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create database directory structure at %s: %w", dir, err)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create database directory structure at %s: %w", path, err)
 	}
 
-	// "sqlite3" is the standard driver name (requires github.com/mattn/go-sqlite3
-	// or the pure-Go modernc.org/sqlite driver)
-	db, err := sql.Open("sqlite3", path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	d := &DB{
+		keysPath: filepath.Join(path, "keys.json"),
+		envsPath: filepath.Join(path, "envs.json"),
 	}
 
-	// =====================================================================
-	// CRITICAL SQLITE CONCURRENCY OPTIMIZATION
-	// =====================================================================
-	// SQLite is an in-process database and only supports exactly ONE writer
-	// at a time. Go's database/sql package naturally spawns multiple connection
-	// threads. If two Go threads try to write to SQLite simultaneously,
-	// you will get a fatal "database is locked" error.
-	//
-	// We restrict the connection pool to exactly 1 open connection to completely
-	// eliminate write deadlocks and transaction conflicts.
-	// =====================================================================
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-
-	d := &DB{db: db}
-
-	// Automatically run database table creations and migrations on boot [1]
-	if err := d.initSchema(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to initialize database schema: %w", err)
+	if err := d.loadKeysLocked(); err != nil {
+		return nil, fmt.Errorf("failed to load keys.json: %w", err)
+	}
+	if err := d.loadEnvsLocked(); err != nil {
+		return nil, fmt.Errorf("failed to load envs.json: %w", err)
 	}
 
 	return d, nil
 }
 
-func (d *DB) initSchema() error {
-	// Table 1: Configuration table for allowed public keys
-	_, err := d.db.Exec(`
-		CREATE TABLE IF NOT EXISTS allowed_keys (
-			pubkey TEXT PRIMARY KEY,
-			key_expires_after INTEGER DEFAULT 0, -- Stored as nanoseconds [2]
-			environment TEXT DEFAULT '[]',       -- JSON string of EnvConfigSlice [1]
-			max_sessions INTEGER DEFAULT 0,
-			max_containers INTEGER DEFAULT 0,        
-			max_users      INTEGER DEFAULT 0,        
-			max_namespaces INTEGER DEFAULT 0,        
-			logins_used INTEGER DEFAULT 0,
-			system_user_count INTEGER DEFAULT 0,
-			containters_count INTEGER DEFAULT 0,
-			namespaces_Count INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-			
-		);
-	`)
+// =====================================================================
+// LOW LEVEL LOAD / SAVE (atomic write via temp file + rename)
+// =====================================================================
+
+func (d *DB) loadKeysLocked() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	bytes, err := os.ReadFile(d.keysPath)
+	if errors.Is(err, os.ErrNotExist) {
+		d.keys = []AccessKeyRecord{}
+		return d.saveKeysUnlocked()
+	}
 	if err != nil {
 		return err
 	}
-
-	// Table 2: Tracks all actively spawned containers, system users, and namespaces [3]
-	_, err = d.db.Exec(`
-		CREATE TABLE IF NOT EXISTS created_envs (
-			id TEXT PRIMARY KEY,
-			pubkey TEXT,
-			env_type TEXT,                       -- "container", "systemUser", "HostSharedNamespace"
-			name TEXT,              -- username, container name, or jail dir
-			image_name TEXT DEFAULT '',
-			user_requested_name TEXT,
-			setting TEXT DEFAULT '{}',           -- JSON representation of EnvSetting [1]
-			expires_at DATETIME NOT NULL,
-			created_at DATETIME NOT NULL,
-			survive_reboot INTEGER DEFAULT 1 -- 0 for false, 1 for true
-		);
-	`)
-	return err
+	if len(strings.TrimSpace(string(bytes))) == 0 {
+		d.keys = []AccessKeyRecord{}
+		return nil
+	}
+	var keys []AccessKeyRecord
+	if err := json.Unmarshal(bytes, &keys); err != nil {
+		return fmt.Errorf("malformed keys.json: %w", err)
+	}
+	d.keys = keys
+	return nil
 }
 
-// HasColumn helper for schema migrations
-func (d *DB) HasColumn(tableName, columnName string) (bool, error) {
-	query := fmt.Sprintf("PRAGMA table_info(%s)", tableName)
-	rows, err := d.db.Query(query)
-	if err != nil {
-		return false, err
+func (d *DB) loadEnvsLocked() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	bytes, err := os.ReadFile(d.envsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		d.envs = []ENVs{}
+		return d.saveEnvsUnlocked()
 	}
-	defer rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(bytes))) == 0 {
+		d.envs = []ENVs{}
+		return nil
+	}
+	var envs []ENVs
+	if err := json.Unmarshal(bytes, &envs); err != nil {
+		return fmt.Errorf("malformed envs.json: %w", err)
+	}
+	d.envs = envs
+	return nil
+}
 
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dfltValue any
+// saveKeysUnlocked / saveEnvsUnlocked assume the caller already holds d.mu.
+func (d *DB) saveKeysUnlocked() error {
+	return atomicWriteJSON(d.keysPath, d.keys)
+}
 
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
-			if name == columnName {
-				return true, nil
+func (d *DB) saveEnvsUnlocked() error {
+	return atomicWriteJSON(d.envsPath, d.envs)
+}
+
+func atomicWriteJSON(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON for %s: %w", path, err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("failed to atomically replace %s: %w", path, err)
+	}
+	return nil
+}
+
+// =====================================================================
+// ACCESS KEY LOOKUPS
+// =====================================================================
+
+// GetRecord retrieves the configuration of a specific allowed public key.
+// Matches against the PubKeys slice on each record.
+func (d *DB) GetRecord(key string) (*AccessKeyRecord, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	for i := range d.keys {
+		for _, pk := range d.keys[i].PubKeys {
+			if pk == key {
+				rec := d.keys[i] // copy
+				return &rec, nil
 			}
 		}
 	}
-	return false, nil
-}
-
-// GetRecord retrieves the configuration of a specific allowed public key
-func (d *DB) GetRecord(key string) (*AccessKeyRecord, error) {
-	query := `
-		SELECT pubkey,
-		key_expires_after,
-		environment,
-		max_sessions,
-		max_containers,	
-		max_users,
-		max_namespaces,
-		logins_used,
-		system_user_count,
-		containters_count,
-		namespaces_Count ,
-		created_at
-		FROM allowed_keys 
-		WHERE pubkey = ?`
-
-	record := &AccessKeyRecord{}
-	err := d.db.QueryRow(query, key).Scan(
-		&record.PubKey,
-		&record.KeyExpiresAfter, // Scans directly into time.Duration! [2]
-		&record.Environment,     // Scans JSON string directly into EnvConfigSlice! [1]
-		&record.MaxSessions,
-		&record.MaxContainers,
-		&record.MaxUsers,
-		&record.MaxNamespaces,
-		&record.LoginsUsed,
-		&record.SysUsersCount,
-		&record.ContaintersCount,
-		&record.NamespacesCount,
-		&record.CreatedAt,
-	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	return record, nil
+	return nil, nil
 }
 
 func (d *DB) IsEligibleKey(key string) bool {
-	query := `SELECT EXISTS(SELECT 1 FROM allowed_keys WHERE pubkey = ? LIMIT 1)`
-
-	var exists bool
-	err := d.db.QueryRow(query, key).Scan(&exists)
+	rec, err := d.GetRecord(key)
 	if err != nil {
 		log.Printf("[DB] Failed to check key eligibility: %v", err)
 		return false
 	}
-
-	return exists
+	return rec != nil && rec.IsActive
 }
 
 // HasActiveEnv checks if there is an active environment of a specific type
-// (e.g., "container" or "system-user") currently running for the given public key.
+// (e.g. "container") currently running for the given public key.
 func (d *DB) HasActiveEnv(key, envType string) bool {
-	// We use an optimized multi-column EXISTS check [1].
-	// This instantly stops scanning the table the moment the first match is found.
-	query := `
-		SELECT EXISTS(
-			SELECT 1 FROM created_envs 
-			WHERE pubkey = ? AND env_type = ? 
-			LIMIT 1
-		)`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	var exists bool
-	// Both parameters are safely bound to prevent SQL Injection [1, 2]
-	err := d.db.QueryRow(query, key, envType).Scan(&exists)
-	if err != nil {
-		log.Printf("[DB] Failed to check active env (%s) for key %s...: %v", envType, key[:8], err)
-		return false
+	for _, e := range d.envs {
+		if e.PubKey == key && e.EnvType == envType {
+			log.Printf("found active env")
+			return true
+		}
 	}
-
-	return exists
+	log.Printf("found no active env")
+	return false
 }
 
+// =====================================================================
+// ENV LOOKUPS
+// =====================================================================
+
 func (d *DB) GetENVByUserReqestedName(name, pubKey string) (*ENVs, error) {
-	// 1. Prepare the query matching your schema exactly [8]
-	query := `
-		SELECT id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at, survive_reboot
-		FROM created_envs 
-		WHERE user_requested_name = ? AND pubkey = ?`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	env := &ENVs{}
-	var surviveRebootInt int
-
-	// 2. Execute and Scan into the struct
-	// Both parameters are bound to prevent SQL Injection [1, 2]
-	err := d.db.QueryRow(query, name, pubKey).Scan(
-		&env.ID,
-		&env.PubKey,
-		&env.EnvType,
-		&env.Name,
-		&env.ImageName,
-		&env.UserRequestedName,
-		&env.Setting, // Automatically unmarshals the JSON using EnvSetting.Scan()! [1]
-		&env.ExpiresAt,
-		&env.CreatedAt,
-		&surviveRebootInt, // Read as integer from SQLite
-	)
-
-	// 3. Handle errors
-	if err != nil {
-		// Return nil, nil if the record doesn't exist (this is an expected logic event, not a system failure)
-		if err == sql.ErrNoRows {
-			return nil, nil
+	for i := range d.envs {
+		e := &d.envs[i]
+		if e.UserRequestedName == name && e.PubKey == pubKey {
+			cp := *e
+			return &cp, nil
 		}
-		log.Printf("failed to query environment by requested name: %v", err)
-		return nil, ErrFailedToQueryByReqNmae
 	}
-
-	// 4. Map the integer state back to Go boolean
-	env.SurviveReboot = surviveRebootInt == 1
-
-	return env, nil
+	return nil, nil
 }
 
 func (d *DB) GetENVByname(name, pubKey string) (*ENVs, error) {
-	// 1. Prepare the query matching your schema exactly [8]
-	query := `
-		SELECT id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at, survive_reboot
-		FROM created_envs 
-		WHERE name = ? AND pubkey = ?`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	env := &ENVs{}
-	var surviveRebootInt int
-
-	// 2. Execute and Scan into the struct
-	// Both parameters are bound to prevent SQL Injection [1, 2]
-	err := d.db.QueryRow(query, name, pubKey).Scan(
-		&env.ID,
-		&env.PubKey,
-		&env.EnvType,
-		&env.Name,
-		&env.ImageName,
-		&env.UserRequestedName,
-		&env.Setting, // Automatically unmarshals the JSON using EnvSetting.Scan()! [1]
-		&env.ExpiresAt,
-		&env.CreatedAt,
-		&surviveRebootInt, // Read as integer from SQLite
-	)
-
-	// 3. Handle errors
-	if err != nil {
-		// Return nil, nil if the record doesn't exist (this is an expected logic event, not a system failure)
-		if err == sql.ErrNoRows {
-			return nil, nil
+	for i := range d.envs {
+		e := &d.envs[i]
+		if e.Name == name && e.PubKey == pubKey {
+			cp := *e
+			return &cp, nil
 		}
-		log.Printf("failed to query environment by requested name: %v", err)
-		return nil, ErrFailedToQueryByReqNmae
 	}
-
-	// 4. Map the integer state back to Go boolean
-	env.SurviveReboot = surviveRebootInt == 1
-
-	return env, nil
+	return nil, nil
 }
 
-// GetENVs retrieves all active environments associated with a specific public key.
-// It returns a slice of environment records, or an error if the query fails.
+// GetENVs retrieves all environments associated with a specific public key.
 func (d *DB) GetENVs(key string) ([]*ENVs, error) {
-	// 1. Prepare the query to grab all columns [8]
-	query := `
-		SELECT id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at ,survive_reboot
-		FROM created_envs 
-		WHERE pubkey = ?`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	// 2. Execute the query
-	rows, err := d.db.Query(query, key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query created_envs: %w", err)
-	}
-	// CRITICAL: Always defer rows.Close() immediately to prevent database connection leaks!
-	defer rows.Close()
-
-	var envs []*ENVs
-
-	// 3. Iterate through the database rows
-	for rows.Next() {
-		env := &ENVs{}
-
-		// Go's sql package automatically calls EnvSetting.Scan() behind the scenes,
-		// converting the database's JSON string back into your structured struct! [1, 8]
-		err := rows.Scan(
-			&env.ID,
-			&env.PubKey,
-			&env.EnvType,
-			&env.Name,
-			&env.ImageName,
-			&env.UserRequestedName,
-			&env.Setting, // Automatically unmarshaled [1]
-			&env.ExpiresAt,
-			&env.CreatedAt,
-			&env.SurviveReboot,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan environment row: %w", err)
+	var out []*ENVs
+	for i := range d.envs {
+		if d.envs[i].PubKey == key {
+			cp := d.envs[i]
+			out = append(out, &cp)
 		}
-
-		envs = append(envs, env)
 	}
-
-	// 4. Check for any errors that occurred during the row iteration [8]
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error occurred during row iteration: %w", err)
-	}
-
-	return envs, nil
+	return out, nil
 }
 
 func (d *DB) GetEnvsByType(key string, envType string) ([]*ENVs, error) {
-	// 1. Prepare the query to grab all columns [8]
-	query := `
-		SELECT id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at ,survive_reboot
-		FROM created_envs 
-		WHERE pubkey = ? AND env_type = ?`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	// 2. Execute the query
-	rows, err := d.db.Query(query, key, envType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query created_envs: %w", err)
-	}
-	// CRITICAL: Always defer rows.Close() immediately to prevent database connection leaks!
-	defer rows.Close()
-
-	var envs []*ENVs
-
-	// 3. Iterate through the database rows
-	for rows.Next() {
-		env := &ENVs{}
-
-		// Go's sql package automatically calls EnvSetting.Scan() behind the scenes,
-		// converting the database's JSON string back into your structured struct! [1, 8]
-		err := rows.Scan(
-			&env.ID,
-			&env.PubKey,
-			&env.EnvType,
-			&env.Name,
-			&env.ImageName,
-			&env.UserRequestedName,
-			&env.Setting, // Automatically unmarshaled [1]
-			&env.ExpiresAt,
-			&env.CreatedAt,
-			&env.SurviveReboot,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan environment row: %w", err)
+	var out []*ENVs
+	for i := range d.envs {
+		if d.envs[i].PubKey == key && d.envs[i].EnvType == envType {
+			cp := d.envs[i]
+			out = append(out, &cp)
 		}
-
-		envs = append(envs, env)
 	}
-
-	// 4. Check for any errors that occurred during the row iteration [8]
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error occurred during row iteration: %w", err)
-	}
-
-	return envs, nil
+	return out, nil
 }
 
 func (d *DB) GetEnvByTypeAndName(key, name, envType string) (*ENVs, error) {
-	// 1. Prepare the query matching your schema exactly [8]
-	query := `
-		SELECT id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at, survive_reboot
-		FROM created_envs 
-		WHERE name = ? AND pubkey = ? AND env_type =?`
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	env := &ENVs{}
-	var surviveRebootInt int
-
-	// 2. Execute and Scan into the struct
-	// Both parameters are bound to prevent SQL Injection [1, 2]
-	err := d.db.QueryRow(query, name, key, envType).Scan(
-		&env.ID,
-		&env.PubKey,
-		&env.EnvType,
-		&env.Name,
-		&env.ImageName,
-		&env.UserRequestedName,
-		&env.Setting, // Automatically unmarshals the JSON using EnvSetting.Scan()! [1]
-		&env.ExpiresAt,
-		&env.CreatedAt,
-		&surviveRebootInt, // Read as integer from SQLite
-	)
-
-	// 3. Handle errors
-	if err != nil {
-		// Return nil, nil if the record doesn't exist (this is an expected logic event, not a system failure)
-		if err == sql.ErrNoRows {
-			return nil, nil
+	for i := range d.envs {
+		e := &d.envs[i]
+		if e.Name == name && e.PubKey == key && e.EnvType == envType {
+			cp := *e
+			return &cp, nil
 		}
-		log.Printf("failed to query environment by requested name: %v", err)
-		return nil, ErrFailedToQueryByReqNmae
 	}
-
-	// 4. Map the integer state back to Go boolean
-	env.SurviveReboot = surviveRebootInt == 1
-
-	return env, nil
+	return nil, nil
 }
 
-var ErrDuplicateEnvName = errors.New("an active environment with this name already exists for this key")
+// =====================================================================
+// MUTATIONS
+// =====================================================================
 
 func (d *DB) AddENV(env *ENVs) error {
-	// 1. Generate a unique ID if none was provided by the caller
 	if env.ID == "" {
-		env.ID = hex.EncodeToString(randomBytes(16)) // Generates a unique 32-character hex string
+		env.ID = hex.EncodeToString(randomBytes(16))
 	}
 	if env.CreatedAt.IsZero() {
 		env.CreatedAt = time.Now()
 	}
 
-	// 2. SECURITY CHECK: Ensure the requested name is unique for this specific user [1]
-	// We only run this check if the user actually requested a custom name alias
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Uniqueness check on UserRequestedName per pubkey, same semantics as before.
 	if env.UserRequestedName != "" {
-		existing, err := d.GetENVByUserReqestedName(env.UserRequestedName, env.PubKey)
-		if err != nil {
-			return fmt.Errorf("failed to verify name uniqueness: %w", err)
-		}
-		if existing != nil {
-			// A duplicate active environment name already exists! Reject. [1]
-			return ErrDuplicateEnvName
+		for _, e := range d.envs {
+			if e.UserRequestedName == env.UserRequestedName && e.PubKey == env.PubKey {
+				return ErrDuplicateEnvName
+			}
 		}
 	}
 
-	// FIXED: Added the 10th placeholder "?" to match the 10 columns exactly!
-	query := `
-		INSERT INTO created_envs (id, pubkey, env_type, name, image_name, user_requested_name, setting, expires_at, created_at, survive_reboot)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-
-	// Convert Go bool to standard SQL 0/1 integer
-	surviveRebootInt := 0
-	if env.SurviveReboot {
-		surviveRebootInt = 1
-	}
-
-	// 3. Execute insertion
-	_, err := d.db.Exec(
-		query,
-		env.ID,
-		env.PubKey,
-		env.EnvType,
-		env.Name,
-		env.ImageName,
-		env.UserRequestedName,
-		env.Setting, // Automatically serialized to JSON [1]
-		env.ExpiresAt,
-		env.CreatedAt,
-		surviveRebootInt,
-	)
-	if err != nil {
-		log.Printf("[DB] Failed to insert created_env %s (%s): %v", env.Name, env.EnvType, err)
+	d.envs = append(d.envs, *env)
+	if err := d.saveEnvsUnlocked(); err != nil {
+		// roll back in-memory append on failed flush
+		d.envs = d.envs[:len(d.envs)-1]
+		log.Printf("[DB] Failed to persist new env %s (%s): %v", env.Name, env.EnvType, err)
 		return fmt.Errorf("failed to insert created_env: %w", err)
 	}
-
 	return nil
 }
 
-func (e EnvConfigSlice) Value() (driver.Value, error) {
-	if e == nil {
-		return "[]", nil
-	}
-	b, err := json.Marshal(e)
-	return string(b), err
-}
+// UpdateKeyField safely updates a single field on an AccessKeyRecord,
+// matched by one of its PubKeys, then persists keys.json.
+func (d *DB) UpdateKeyField(pubkey, field string, newValue any) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-func (e *EnvConfigSlice) Scan(value any) error {
-	if value == nil {
-		*e = EnvConfigSlice{}
-		return nil
+	idx := -1
+	for i := range d.keys {
+		for _, pk := range d.keys[i].PubKeys {
+			if pk == pubkey {
+				idx = i
+				break
+			}
+		}
+		if idx != -1 {
+			break
+		}
 	}
-	var bytes []byte
-	switch v := value.(type) {
-	case string:
-		bytes = []byte(v)
-	case []byte:
-		bytes = v
+	if idx == -1 {
+		return fmt.Errorf("no access key record found for pubkey %s", shortKey(pubkey))
+	}
+
+	rec := &d.keys[idx]
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "active":
+		v, ok := newValue.(bool)
+		if !ok {
+			return fmt.Errorf("field %q expects bool", field)
+		}
+		rec.IsActive = v
+	case "survive_reboot":
+		v, ok := newValue.(bool)
+		if !ok {
+			return fmt.Errorf("field %q expects bool", field)
+		}
+		rec.SurviveReboot = v
+	case "key_expires_afer", "keyexpiresafter":
+		v, ok := newValue.(time.Duration)
+		if !ok {
+			return fmt.Errorf("field %q expects time.Duration", field)
+		}
+		rec.KeyExpiresAfter = v
+	case "max_containers", "maxcontainers":
+		v, ok := newValue.(int)
+		if !ok {
+			return fmt.Errorf("field %q expects int", field)
+		}
+		rec.MaxContainers = v
+	case "containters_count", "containerscount":
+		v, ok := newValue.(int)
+		if !ok {
+			return fmt.Errorf("field %q expects int", field)
+		}
+		rec.ContaintersCount = v
+	case "expires_after", "expiresafter":
+		v, ok := newValue.(time.Duration)
+		if !ok {
+			return fmt.Errorf("field %q expects time.Duration", field)
+		}
+		rec.ExpiresAfter = v
 	default:
-		return errors.New("unsupported scan type for EnvConfigSlice")
-	}
-	return json.Unmarshal(bytes, e)
-}
-
-func (es EnvSetting) Value() (driver.Value, error) {
-	b, err := json.Marshal(es)
-	return string(b), err
-}
-
-func (es *EnvSetting) Scan(value any) error {
-	if value == nil {
-		*es = EnvSetting{}
-		return nil
-	}
-	var bytes []byte
-	switch v := value.(type) {
-	case string:
-		bytes = []byte(v)
-	case []byte:
-		bytes = v
-	default:
-		return errors.New("unsupported scan type for EnvSetting")
-	}
-	return json.Unmarshal(bytes, es)
-}
-
-// Strict whitelist for table and column names to prevent SQL Injection [1, 2]
-var safeIdentifiers = map[string]bool{
-	"allowed_keys":      true,
-	"created_envs":      true,
-	"shell":             true,
-	"groupname":         true,
-	"logins_used":       true,
-	"expires_at":        true,
-	"env_type":          true,
-	"name":              true,
-	"image_name":        true,
-	"sys_users_active":  true,
-	"containers_active": true,
-	"SysUsersCount":     true,
-	"ContaintersCount":  true,
-	"NamespacesCount":   true,
-}
-
-// UpdateField safely updates a single column on a table using strict parameterization [1, 2]
-func (d *DB) UpdateField(table, publickey, column string, newValue any) error {
-	table = strings.ToLower(strings.TrimSpace(table))
-	column = strings.ToLower(strings.TrimSpace(column))
-
-	if !safeIdentifiers[table] || !safeIdentifiers[column] {
-		return fmt.Errorf("unsafe table (%s) or column (%s) name provided", table, column)
+		return fmt.Errorf("unsupported field %q on AccessKeyRecord", field)
 	}
 
-	query := fmt.Sprintf("UPDATE %s SET %s = ? WHERE pubkey = ?", table, column)
-
-	_, err := d.db.Exec(query, newValue, publickey)
-	if err != nil {
-		log.Printf("[DB] Failed to update %s.%s for key %s: %v", table, column, publickey[:8], err)
-		return fmt.Errorf("failed to execute update: %w", err)
+	if err := d.saveKeysUnlocked(); err != nil {
+		log.Printf("[DB] Failed to update %s for key %s: %v", field, shortKey(pubkey), err)
+		return fmt.Errorf("failed to persist update: %w", err)
 	}
-
 	return nil
 }
 
-// PurgeExpiredKeys actively scans the database, deletes any expired public keys,
-// and forcefully wipes any active system users associated with those keys [3, 4].
+// UpdateEnvField safely updates a single field on an ENVs record by ID,
+// then persists envs.json.
+func (d *DB) UpdateEnvField(id, field string, newValue any) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	idx := -1
+	for i := range d.envs {
+		if d.envs[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return fmt.Errorf("no environment found with id %s", id)
+	}
+
+	e := &d.envs[idx]
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "name":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		e.Name = v
+	case "image_name", "imagename":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		e.ImageName = v
+	case "expires_at", "expiresat":
+		v, ok := newValue.(time.Time)
+		if !ok {
+			return fmt.Errorf("field %q expects time.Time", field)
+		}
+		e.ExpiresAt = v
+	case "survive_reboot", "survivereboot":
+		v, ok := newValue.(bool)
+		if !ok {
+			return fmt.Errorf("field %q expects bool", field)
+		}
+		e.SurviveReboot = v
+	default:
+		return fmt.Errorf("unsupported field %q on ENVs", field)
+	}
+
+	if err := d.saveEnvsUnlocked(); err != nil {
+		log.Printf("[DB] Failed to update %s for env %s: %v", field, id, err)
+		return fmt.Errorf("failed to persist update: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) deleteEnvByIDLocked(id string) {
+	for i := range d.envs {
+		if d.envs[i].ID == id {
+			d.envs = append(d.envs[:i], d.envs[i+1:]...)
+			return
+		}
+	}
+}
+
+func (d *DB) deleteKeyLocked(pubkey string) {
+	for i := range d.keys {
+		for _, pk := range d.keys[i].PubKeys {
+			if pk == pubkey {
+				d.keys = append(d.keys[:i], d.keys[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// =====================================================================
+// REAPER / SWEEPER
+// =====================================================================
+
+// PurgeExpired scans the store, deletes any expired access keys, and
+// forcefully tears down any active environments associated with them.
+// It also purges individually-expired environments.
 func (d *DB) PurgeExpired() {
 	now := time.Now()
 
-	// 1. Purge expired keys from the database [1]
-	// If created_at + key_expires_after is in the past, the key is expired [1, 2]
-	rows, err := d.db.Query("SELECT pubkey, key_expires_after, created_at FROM allowed_keys WHERE key_expires_after > 0")
-	if err != nil {
-		log.Printf("[DB] Reaper: Failed to query keys for purging: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var pubkey string
-		var expiresAfter time.Duration
-		var createdAt time.Time
-
-		if err := rows.Scan(&pubkey, &expiresAfter, &createdAt); err == nil {
-			if createdAt.Add(expiresAfter).Before(now) {
-				log.Printf("[DB] Reaper: Actively removing expired public key: %s...", pubkey[:8])
-
-				// Clean up any dynamic active environments linked to this key [3]
-				d.purgeEnvironmentsByPubKey(pubkey)
-
-				_, _ = d.db.Exec("DELETE FROM allowed_keys WHERE pubkey = ?", pubkey)
-			}
+	// ---- PART 1: purge expired access keys ----
+	d.mu.Lock()
+	var expiredKeys []string
+	for _, rec := range d.keys {
+		if rec.KeyExpiresAfter > 0 && rec.CreatedAt.Add(rec.KeyExpiresAfter).Before(now) {
+			expiredKeys = append(expiredKeys, rec.PubKeys...)
 		}
 	}
+	d.mu.Unlock()
 
-	// 2. Purge expired individual environments (Containers, SystemUsers, Jails) [3]
-	envRows, err := d.db.Query("SELECT id, name, env_type FROM created_envs WHERE expires_at < ?", now)
-	if err != nil {
-		log.Printf("[DB] Reaper: Failed to query expired environments: %v", err)
-		return
-	}
-	defer envRows.Close()
+	for _, pubkey := range expiredKeys {
+		log.Printf("[DB] Reaper: Actively removing expired public key: %s...", shortKey(pubkey))
+		d.purgeEnvironmentsByPubKey(pubkey)
 
-	for envRows.Next() {
-
-		var id, name, envType string
-		if err := envRows.Scan(&id, &name, &envType); err == nil {
-
-			log.Printf("[DB] Reaper: Environment %s expired! Forcefully destroying.", name)
-			d.destroyEnvironment(name, envType)
-			_, _ = d.db.Exec("DELETE FROM created_envs WHERE id = ?", id)
+		d.mu.Lock()
+		d.deleteKeyLocked(pubkey)
+		if err := d.saveKeysUnlocked(); err != nil {
+			log.Printf("[DB] Reaper: failed to persist key deletion: %v", err)
 		}
+		d.mu.Unlock()
+	}
+
+	// ---- PART 2: purge individually-expired environments ----
+	d.mu.RLock()
+	type expiredEnv struct{ id, name, envType string }
+	var expiredEnvs []expiredEnv
+	for _, e := range d.envs {
+		if e.ExpiresAt.Before(now) {
+			expiredEnvs = append(expiredEnvs, expiredEnv{e.ID, e.Name, e.EnvType})
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, e := range expiredEnvs {
+		log.Printf("[DB] Reaper: Environment %s expired! Forcefully destroying.", e.name)
+		d.destroyEnvironment(e.name, e.envType)
+
+		d.mu.Lock()
+		d.deleteEnvByIDLocked(e.id)
+		if err := d.saveEnvsUnlocked(); err != nil {
+			log.Printf("[DB] Reaper: failed to persist env deletion: %v", err)
+		}
+		d.mu.Unlock()
 	}
 }
 
-// RunStartupSweeper scans created_envs and purges any orphaned system accounts
-// left behind by an abrupt server crash or reboot [3, 4].
+// RunStartupSweeper purges any orphaned environments left behind by an
+// abrupt crash or reboot, unless they were configured with SurviveReboot.
 func (d *DB) RunStartupSweeper() {
-	rows, err := d.db.Query("SELECT id,name, env_type,survive_reboot FROM created_envs")
-	if err != nil {
-		log.Printf("[DB] Failed to query created_envs for sweeping: %v", err)
-		return
+	d.mu.RLock()
+	type orphanedEnv struct {
+		id, name, envType string
+		survive           bool
 	}
-	defer rows.Close()
+	orphaned := make([]orphanedEnv, 0, len(d.envs))
+	for _, e := range d.envs {
+		orphaned = append(orphaned, orphanedEnv{e.ID, e.Name, e.EnvType, e.SurviveReboot})
+	}
+	d.mu.RUnlock()
 
 	purgedCount := 0
-	for rows.Next() {
-		var id, name, envType string
-		var survive bool
-		if err := rows.Scan(&id, &name, &envType, &survive); err == nil {
-			if survive {
-				continue
-			}
-			d.destroyEnvironment(name, envType)
-			_, _ = d.db.Exec("DELETE FROM created_envs WHERE id = ?", id)
-			log.Printf("[DB] Sweeper: Forcefully removing orphaned system user: %s", name)
-			purgedCount++
+	for _, e := range orphaned {
+		if e.survive {
+			continue // Let environments configured with 'survive_reboot = true' live!
 		}
+		d.destroyEnvironment(e.name, e.envType)
+
+		d.mu.Lock()
+		d.deleteEnvByIDLocked(e.id)
+		if err := d.saveEnvsUnlocked(); err != nil {
+			log.Printf("[DB] Sweeper: failed to persist env deletion: %v", err)
+		}
+		d.mu.Unlock()
+
+		log.Printf("[DB] Sweeper: Forcefully removing orphaned environment: %s", e.name)
+		purgedCount++
 	}
-
 	log.Printf("[DB] Sweeper finished. Successfully purged %d orphaned environments.", purgedCount)
-
 }
 
-// destroyEnvironment performs the actual physical OS-level unmounting, deletion, and containment shutdown [4]
+// destroyEnvironment performs the actual physical OS-level / container
+// teardown. Only "container" is supported for now.
 func (d *DB) destroyEnvironment(name, envType string) {
 	switch envType {
-	case "system-user":
-		// Forcefully kill user's processes and delete their home directory [4]
-		DeleteSystemUser(name)
 	case "container":
-		// Forcefully kill and remove the running container [4]
 		KillAndRemoveContainer(context.Background(), name)
-
-	case "HostSharedNamespace":
-		// Forcefully detach the on-demand bind mounts and delete directory [4]
-		DestroyOnDemandJail(name)
+	default:
+		log.Printf("[DB] destroyEnvironment: unsupported env type %q for %s (only \"container\" is currently supported)", envType, name)
 	}
 }
 
 func (d *DB) purgeEnvironmentsByPubKey(pubkey string) {
-	rows, err := d.db.Query("SELECT name, env_type FROM created_envs WHERE pubkey = ?", pubkey)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var name, envType string
-		if err := rows.Scan(&name, &envType); err == nil {
-			d.destroyEnvironment(name, envType)
+	d.mu.RLock()
+	type target struct{ id, name, envType string }
+	var targets []target
+	for _, e := range d.envs {
+		if e.PubKey == pubkey {
+			targets = append(targets, target{e.ID, e.Name, e.EnvType})
 		}
 	}
-	_, _ = d.db.Exec("DELETE FROM created_envs WHERE pubkey = ?", pubkey)
+	d.mu.RUnlock()
+
+	for _, t := range targets {
+		d.destroyEnvironment(t.name, t.envType)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	filtered := d.envs[:0]
+	for _, e := range d.envs {
+		if e.PubKey != pubkey {
+			filtered = append(filtered, e)
+		}
+	}
+	d.envs = filtered
+	if err := d.saveEnvsUnlocked(); err != nil {
+		log.Printf("[DB] Failed to persist env purge for pubkey %s: %v", shortKey(pubkey), err)
+	}
 }
 
-// Helper to support 'd' (days) in JSON strings [1.3.1]
+// =====================================================================
+// CONFIG LOADER (keys.json source-of-truth import)
+// =====================================================================
+
+// parseDurationWithDays supports a trailing 'd' suffix (e.g. "30d") in
+// addition to standard Go duration strings, plus "0"/"always"/"onetime".
 func parseDurationWithDays(s string) (time.Duration, error) {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "0" || s == "always" || s == "onetime" {
 		return 0, nil
 	}
-
 	if strings.HasSuffix(s, "d") {
 		daysStr := strings.TrimSuffix(s, "d")
 		days, err := strconv.Atoi(daysStr)
@@ -764,94 +636,124 @@ func parseDurationWithDays(s string) (time.Duration, error) {
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
-
 	return time.ParseDuration(s)
 }
 
-// LoadAccessKeysConf reads the JSON file, parses durations, and saves to SQLite [1, 2].
-func (d *DB) LoadAccessKeysConf(filepath string) (map[string]AccessKeyRecord, error) {
-	fileBytes, err := os.ReadFile(filepath)
+// LoadAccessKeysConf reads the source JSON config file (the format you
+// hand-author / ship), parses durations, and upserts each entry into the
+// in-memory + on-disk keys.json store, keyed by matching PubKeys slices.
+func (d *DB) LoadAccessKeysConf(filePath string) (map[string]AccessKeyRecord, error) {
+	fileBytes, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	// Parse JSON
 	var rawList []struct {
-		PubKey          string      `json:"pubkey"`
-		KeyExpiresAfter string      `json:"key_expires_afer"`
-		Environment     []EnvConfig `json:"environment"`
-		MaxSessions     int         `json:"max_sessions"`
-		MaxContainers   int         `json:"max_containers,omitempty"`
-		MaxUsers        int         `json:"max_users,omitempty"`
-		MaxNamespaces   int         `json:"max_namespaces,omitempty"`
+		IsActive        bool           `json:"active"`
+		SurviveReboot   bool           `json:"survive_reboot"`
+		PubKeys         []string       `json:"pubkey"`
+		KeyExpiresAfter string         `json:"key_expires_afer"`
+		MaxContainers   int            `json:"max_containers"`
+		Environment     EnvConfigSlice `json:"environment"`
+		CreatedAt       string         `json:"created_at"`
+		ExpiresAfter    string         `json:"expires_after"`
 	}
-
 	if err := json.Unmarshal(fileBytes, &rawList); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
-	records := make(map[string]AccessKeyRecord)
+	records := make(map[string]AccessKeyRecord, len(rawList))
 
-	// Start database transaction [2]
-	tx, err := d.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	query := `
-		INSERT INTO allowed_keys (pubkey, key_expires_after, environment, max_sessions, max_containers, max_users, max_namespaces, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(pubkey) DO UPDATE SET
-			environment = excluded.environment;
-	`
-	stmt, err := tx.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	for _, item := range rawList {
-		expireDuration, err := parseDurationWithDays(item.KeyExpiresAfter)
+		keyExpire, err := parseDurationWithDays(item.KeyExpiresAfter)
 		if err != nil {
-			return nil, fmt.Errorf("key %s has invalid key_expires_after: %w", item.PubKey[:8], err)
+			id := "unknown"
+			if len(item.PubKeys) > 0 {
+				id = shortKey(item.PubKeys[0])
+			}
+			return nil, fmt.Errorf("key %s has invalid key_expires_after: %w", id, err)
+		}
+
+		// Validate only the "container" type is used, per current scope.
+		for _, env := range item.Environment {
+			if env.Type != "container" {
+				return nil, fmt.Errorf("unsupported environment type %q (only \"container\" is currently supported)", env.Type)
+			}
+		}
+
+		createdAt := time.Now()
+		if item.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, item.CreatedAt); err == nil {
+				createdAt = t
+			}
+		}
+		var expiresAfter time.Duration
+		if item.ExpiresAfter != "" {
+			if v, err := parseDurationWithDays(item.ExpiresAfter); err == nil {
+				expiresAfter = v
+			}
 		}
 
 		record := AccessKeyRecord{
-			PubKey:          item.PubKey,
-			KeyExpiresAfter: expireDuration,
+			IsActive:        item.IsActive,
+			SurviveReboot:   item.SurviveReboot,
+			PubKeys:         item.PubKeys,
+			KeyExpiresAfter: keyExpire,
 			Environment:     item.Environment,
-			MaxSessions:     item.MaxSessions,
 			MaxContainers:   item.MaxContainers,
-			MaxUsers:        item.MaxUsers,
-			MaxNamespaces:   item.MaxNamespaces,
+			CreatedAt:       createdAt,
+			ExpiresAfter:    expiresAfter,
 		}
 
-		// Perform safe SQL upsert [1, 2]
-		_, err = stmt.Exec(
-			record.PubKey,
-			record.KeyExpiresAfter,
-			record.Environment,
-			record.MaxSessions,
-			record.MaxContainers,
-			record.MaxUsers,
-			record.MaxNamespaces,
-			time.Now(),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to sync key %s: %w", record.PubKey[:8], err)
+		// Upsert: match an existing record sharing ANY pubkey, else append.
+		matchedIdx := -1
+		for i := range d.keys {
+			if sliceShareElement(d.keys[i].PubKeys, item.PubKeys) {
+				matchedIdx = i
+				break
+			}
+		}
+		if matchedIdx != -1 {
+			// Preserve original CreatedAt / counters, refresh the rest.
+			existing := d.keys[matchedIdx]
+			record.CreatedAt = existing.CreatedAt
+			record.ContaintersCount = existing.ContaintersCount
+			d.keys[matchedIdx] = record
+		} else {
+			d.keys = append(d.keys, record)
 		}
 
-		records[record.PubKey] = record
+		for _, pk := range item.PubKeys {
+			records[pk] = record
+		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if err := d.saveKeysUnlocked(); err != nil {
+		return nil, fmt.Errorf("failed to persist keys.json: %w", err)
 	}
-	// If an existing configuration is being updated in SQLite,
-	// proactively delete the compiled image to force a rebuild on the next login [4].
-	//imageName := fmt.Sprintf("wf_custom_%s", record.PubKey[:8])
-	//_ = exec.Command("podman", "rmi", "-f", imageName).Run()
 
 	return records, nil
+}
+
+func sliceShareElement(a, b []string) bool {
+	set := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		set[v] = struct{}{}
+	}
+	for _, v := range b {
+		if _, ok := set[v]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func shortKey(k string) string {
+	if len(k) > 8 {
+		return k[:8]
+	}
+	return k
 }

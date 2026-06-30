@@ -7,7 +7,7 @@
     "ListenAddr":"",
     "Port":"77",
     "PasswordAuth":true,
-    "PublicKeyAuth":true,
+    "PublicKeyAuth":false,
     "AuthorizedKeysPath":"",
     "AllowLoginAsRoot":false,
     "MaxConnectionsAllowed":0,
