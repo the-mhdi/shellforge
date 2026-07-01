@@ -9,6 +9,8 @@
             "type" : "container",
             "setting": {
                 "survive_reboot":true,
+                "kill_after_exit":false,
+                "stop_after_exit":false,
                 "dockerfile_path": "/etc/shellforge/",
                 "memory_limit": "1g",
                 "cpu_limit": 1.5,
@@ -17,7 +19,7 @@
             "life_span": "0"
         }
     ],
-    "expires_after":"10d"
+    "expires_after":"5 minutes"
   }
 
 ]

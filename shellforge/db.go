@@ -32,8 +32,10 @@ type EnvSetting struct {
 	MemoryLimit    string  `json:"memory_limit,omitempty"`
 	CPULimit       float64 `json:"cpu_limit,omitempty"`
 	GPULimit       string  `json:"gpu_limit,omitempty"`
-	SurviveReboot  bool    `json:"survive_reboot,omitempty"`
-	Shell          string
+	SurviveReboot  bool    `json:"survive_reboot"`
+	StopAfterExit  bool    `json:"stop_after_exit"`
+	KillAfterExit  bool    `json:"kill_after_exit"`
+	Shell          string  `json:"shell,omitempty"`
 }
 
 // AccessKeyRecord represents one entry in keys.json (the allow-list config).
@@ -177,10 +179,12 @@ func atomicWriteJSON(path string, v any) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON for %s: %w", path, err)
 	}
+
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return fmt.Errorf("failed to write temp file %s: %w", tmp, err)
 	}
+
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("failed to atomically replace %s: %w", path, err)
 	}
@@ -225,11 +229,11 @@ func (d *DB) HasActiveEnv(key, envType string) bool {
 
 	for _, e := range d.envs {
 		if e.PubKey == key && e.EnvType == envType {
-			log.Printf("found active env")
+			log.Printf("confirmed:the key has active env")
 			return true
 		}
 	}
-	log.Printf("found no active env")
+	log.Printf("found no active env for the key ")
 	return false
 }
 
@@ -456,6 +460,18 @@ func (d *DB) UpdateEnvField(id, field string, newValue any) error {
 			return fmt.Errorf("field %q expects bool", field)
 		}
 		e.SurviveReboot = v
+	case "stop_after_exit":
+		v, ok := newValue.(bool)
+		if !ok {
+			return fmt.Errorf("field %q expects bool", field)
+		}
+		e.Setting.StopAfterExit = v
+	case "kill_after_exit":
+		v, ok := newValue.(bool)
+		if !ok {
+			return fmt.Errorf("field %q expects bool", field)
+		}
+		e.Setting.KillAfterExit = v
 	default:
 		return fmt.Errorf("unsupported field %q on ENVs", field)
 	}
@@ -734,6 +750,8 @@ func (d *DB) LoadAccessKeysConf(filePath string) (map[string]AccessKeyRecord, er
 	if err := d.saveKeysUnlocked(); err != nil {
 		return nil, fmt.Errorf("failed to persist keys.json: %w", err)
 	}
+
+	log.Printf("ENV confs loaded into memoey from %s\n", filePath)
 
 	return records, nil
 }

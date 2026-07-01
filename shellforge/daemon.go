@@ -1,6 +1,7 @@
 package shellforge
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -421,9 +422,12 @@ func (d *Daemon) listen() {
 				}
 
 				//send ContainersListResponse if no name specified
-				session.WritePacket(MsgServerContainersListResponse, clist.Marshal())
+				err = session.WritePacket(MsgServerContainersListResponse, clist.Marshal())
+				if err != nil {
+					log.Println(err)
+					return
+				}
 				return
-
 			}
 
 			if string(eReq.AccessType) == "container" {
@@ -434,8 +438,18 @@ func (d *Daemon) listen() {
 
 			}
 			env, err := d.DB.GetENVByUserReqestedName(string(eReq.UserRequestedName), pubKeyHex)
+			if err != nil {
+				log.Println("asdsadd")
+				log.Println(err)
+				return
+			}
+			if env == nil {
+				log.Printf("%s doenst exist or belong to this user", string(eReq.UserRequestedName))
+				session.WritePacket(MsgServerNoContainer, nil)
+				return
+			}
 
-			if err == nil && env != nil {
+			if env != nil {
 				chanID := session.IncrementChannelID()
 
 				log.Printf("New Channel for container Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
@@ -448,12 +462,11 @@ func (d *Daemon) listen() {
 					defer session.DeleteActiveChannel(chanID)
 					defer pipeStream.Close()
 
-					err := d.RunContainer(connCtx, runCh, env.Name, env.ImageName, env.Setting.MemoryLimit, env.Setting.CPULimit, env.Setting.GPULimit, 24, 80, pipeStream)
+					err := d.RunContainer(connCtx, runCh, env, 24, 80, pipeStream)
 					if err != nil {
-						log.Println(err)
+						log.Printf("[ERROR RunContainer] %v\n for container %s", err, env.Name)
 						return
 					}
-
 				}()
 
 				<-runCh
@@ -1478,7 +1491,7 @@ func Start(conf DaemonConfig) {
 		log.Fatalf("Failed to open SQLite database: %v", err)
 	}
 
-	log.Printf(" SQLite database Loaded")
+	log.Printf("database Loaded")
 
 	if conf.EnvironmentsJsonConfig != "" {
 		_, err := db.LoadAccessKeysConf(conf.EnvironmentsJsonConfig)
@@ -1613,58 +1626,98 @@ func randomBytes(length int) []byte {
 }
 
 // RunPodmanContainer dynamically starts a fresh container or resumes an existing stopped one [1, 2, 3].
-func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, containerName, imageName, memoryLimit string, cpuLimit float64, gpuLimit string, rows, cols uint16, ch io.ReadWriter) error {
-	log.Printf("[Container] running as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
-	// 1. Check if a container with this name already exists on the host [1, 3]
-	// 'podman container exists' returns exit code 0 if it exists, and non-zero if it doesn't.
-	existsCmd := exec.Command("podman", "container", "exists", containerName)
-	containerExists := existsCmd.Run() == nil
+func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, env *ENVs, rows, cols uint16, ch io.ReadWriter) error {
+	log.Printf("[Container] as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
+	state := getContainerState(env.Name)
+	log.Printf("[Container] Current state of %s: %q", env.Name, state)
+
+	if !env.Setting.StopAfterExit && !env.Setting.KillAfterExit {
+		ctx = context.Background()
+	}
 
 	var cmd *exec.Cmd
 
-	if containerExists {
-		// --- RESUME EXISTING CONTAINER --- [2, 3]
-		// The container already exists from a previous session.
-		// We start and attach (-a -i) directly to it. All previous files and states are intact!
-		log.Printf("[Container] Resuming existing stopped container: %s", containerName)
-		args := []string{"start", "-a", "-i", containerName}
+	switch state {
+	case "running":
+		// Already running — attach to it with exec instead of start,
+		// so we don't conflict with whatever started it.
+		log.Printf("[Container] Container %s is already running, attaching via exec...", env.Name)
+		args := []string{"exec", "-it", env.Name, "/bin/bash"}
 		cmd = exec.CommandContext(ctx, "podman", args...)
-	} else {
-		// --- CREATE FRESH CONTAINER --- [2]
-		// First-time login. We run a new container.
-		// NOTE: We intentionally OMIT the "--rm" flag so the container persists when we exit!
-		log.Printf("[Container] Creating fresh persistent container: %s", containerName)
+
+	case "stopped", "exited", "created":
+		// Normal resume path — container exists but isn't running.
+		log.Printf("[Container] Resuming stopped container: %s", env.Name)
+		args := []string{"start", "-a", "-i", env.Name}
+		cmd = exec.CommandContext(ctx, "podman", args...)
+
+	case "paused":
+		log.Printf("[Container] Unpausing container: %s", env.Name)
+		if err := exec.CommandContext(ctx, "podman", "unpause", env.Name).Run(); err != nil {
+			return fmt.Errorf("failed to unpause container %s: %w", env.Name, err)
+		}
+		args := []string{"exec", "-it", env.Name, "/bin/bash"}
+		cmd = exec.CommandContext(ctx, "podman", args...)
+	case "dead":
+		// Container is wedged — remove it and let the "" branch recreate it
+		log.Printf("[Container] Container %s is dead, removing and recreating...", env.Name)
+		if err := exec.CommandContext(ctx, "podman", "rm", "--force", env.Name).Run(); err != nil {
+			return fmt.Errorf("failed to remove dead container %s: %w", env.Name, err)
+		}
+		// Fall through to fresh creation by recursing or inlining the run args
+		state = ""
+		fallthrough
+	case "": // doesn't exist at all
+		// First-time login — create a fresh persistent container.
+		log.Printf("[Container] Creating fresh persistent container: %s", env.Name)
 		args := []string{
 			"run", "-it",
-			"--name", containerName,
+			"--name", env.Name,
 			"--pull=never",
-			fmt.Sprintf("--memory=%s", memoryLimit),
-			fmt.Sprintf("--cpus=%f", cpuLimit),
+		}
+		if env.Setting.MemoryLimit != "" {
+			args = append(args, fmt.Sprintf("--memory=%s", env.Setting.MemoryLimit))
+		}
+		if env.Setting.CPULimit > 0 {
+			args = append(args, fmt.Sprintf("--cpus=%f", env.Setting.CPULimit))
 		}
 
-		//	var validGPUDevice = regexp.MustCompile(`^(all|[0-9]+(,[0-9]+)*)$`)
-		//	if gpuLimit != "" {
-		//		cleaned := strings.Trim(gpuLimit, `"' `) // strip stray quotes/whitespace
-		//		if !validGPUDevice.MatchString(cleaned) {
-		//			return fmt.Errorf("invalid gpuLimit value %q: expected \"all\" or comma-separated device indices", gpuLimit)
-		//		}
-		//		args = append(args, "--device", fmt.Sprintf("nvidia.com/gpu=%s", cleaned))
-		//
-		//	}
+		//if gpuLimit != "" {
+		//	args = append(args, "--device", fmt.Sprintf("nvidia.com/gpu=%s", gpuLimit))
+		//}
 
-		imageName := fmt.Sprintf("localhost/%s", imageName)
-		args = append(args, imageName)
-
-		listCmd := exec.Command("podman", "images", "--format", "{{.Repository}}:{{.Tag}}")
-		out, _ := listCmd.CombinedOutput()
-		log.Printf("[Container] Visible images at run-time: %s", out)
-
+		args = append(args, fmt.Sprintf("localhost/%s", env.ImageName))
 		cmd = exec.CommandContext(ctx, "podman", args...)
+
+	case "stopping":
+		log.Printf("[Container] Container %s is stopping, waiting up for clean exit...", env.Name)
+		err := waitForContainerState(ctx, env.Name, "exited", 10*time.Second)
+		if err != nil {
+			// Didn't exit cleanly in time — force kill it
+			log.Printf("[Container] Container %s did not exit cleanly, sending SIGKILL...", env.Name)
+			killCmd := exec.CommandContext(ctx, "podman", "kill", "--signal", "SIGKILL", env.Name)
+
+			var stderr bytes.Buffer
+			killCmd.Stderr = &stderr
+			if killErr := killCmd.Run(); killErr != nil {
+				return fmt.Errorf("failed to SIGKILL container %s: %w (stderr: %s)", env.Name, killErr, stderr.String())
+			}
+			// Wait for it to actually reach exited after SIGKILL
+			if waitErr := waitForContainerState(ctx, env.Name, "exited", 5*time.Second); waitErr != nil {
+				return fmt.Errorf("container %s did not exit after SIGKILL: %w", env.Name, waitErr)
+			}
+		}
+		log.Printf("[Container] Container %s exited, resuming...", env.Name)
+		args := []string{"start", "-a", "-i", env.Name}
+		cmd = exec.CommandContext(ctx, "podman", args...)
+	default:
+		return fmt.Errorf("container %s is in unexpected state %q, manual intervention required", env.Name, state)
 	}
 
 	// 2. Spawn the container inside the PTY [3]
 	ptyFd, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
 	if err != nil {
+		close(run) //close on err
 		return err
 	}
 
@@ -1675,7 +1728,7 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, containerN
 		defer pipe.SetPTY(nil)
 	}
 
-	log.Printf("[Container] pty stared: %s", containerName)
+	log.Printf("[Container] pty started: %s", env.Name)
 	close(run) //signal run
 
 	errCh := make(chan error, 2)
@@ -1687,18 +1740,47 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, containerN
 		_, err := io.Copy(ch, ptyFd)
 		errCh <- err
 	}()
-
+	var exerr error
 	select {
 	case <-ctx.Done():
 		// Gracefully stop the container instead of killing it,
 		// allowing internal database/file writes to finish cleanly [4].
-		log.Printf("[Container] Gracefully stopping container %s...", containerName)
-		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
+		if env.Setting.KillAfterExit {
+			log.Printf("[Container] killing container on exit %s...", env.Name)
+			_ = exec.Command("podman", "kill", "--signal", "SIGKILL", env.Name).Run()
+
+		}
+
+		if !env.Setting.KillAfterExit && env.Setting.StopAfterExit {
+			log.Printf("[Container] Gracefully stopping container %s...", env.Name)
+			_ = exec.Command("podman", "stop", "-t", "5", env.Name).Run()
+		}
+
+		log.Printf("[Container] loop exit for %s...", env.Name)
 		return ctx.Err()
-	case <-errCh:
-		// If connection drops, send SIGTERM and give it 5 seconds to stop gracefully [4]
-		_ = exec.Command("podman", "stop", "-t", "5", containerName).Run()
-		log.Printf("[Container] Gracefully stopping container %s...", containerName)
+	case err := <-errCh:
+
+		exerr = err
+
+		log.Printf("[Container] %v\n", err)
+
+		if env.Setting.KillAfterExit {
+			log.Printf("[Container] killing container on exit %s...", env.Name)
+			_ = exec.Command("podman", "kill", "--signal", "SIGKILL", env.Name).Run()
+
+		}
+
+		if !env.Setting.KillAfterExit && env.Setting.StopAfterExit {
+			log.Printf("[Container] Gracefully stopping container %s...", env.Name)
+			_ = exec.Command("podman", "stop", "-t", "5", env.Name).Run()
+		}
+
+	}
+
+	if exerr == nil {
+		if !env.Setting.StopAfterExit && !env.Setting.KillAfterExit {
+			log.Printf("[Container] container %s... stays running in the background", env.Name)
+		}
 	}
 
 	return cmd.Wait()

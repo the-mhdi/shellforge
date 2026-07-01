@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 )
 
 const IMAGE_NAME_PREFIX string = "shf_image_"
@@ -244,4 +246,32 @@ func DeleteContainerImage(ctx context.Context, imageName string) error {
 	}
 
 	return nil
+}
+
+func getContainerState(containerName string) string {
+	cmd := exec.Command("podman", "inspect", "--format", "{{.State.Status}}", containerName)
+	out, err := cmd.Output()
+	if err != nil {
+		return "" // doesn't exist
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func waitForContainerState(ctx context.Context, containerName string, target string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		state := getContainerState(containerName)
+		if state == target {
+			return nil
+		}
+		// Check context cancellation so we don't spin forever if client disconnects
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			// poll again
+		}
+	}
+	return fmt.Errorf("container %s did not reach state %q within %s (current: %s)",
+		containerName, target, timeout, getContainerState(containerName))
 }
