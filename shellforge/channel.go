@@ -5,7 +5,7 @@ import "encoding/binary"
 //every connection from/to the daemon gets a chanID() + every connection from/to the Client gets a chanID()
 //daemon and client has to be aware of the all active channels
 
-type ChannelData struct {
+type Channel struct {
 	ChannelID uint32
 	DataLen   uint32
 	Data      []byte
@@ -45,7 +45,7 @@ type ServerChannelOpenConfirm struct {
 	Success   bool
 }
 
-func (p *ChannelData) Unmarshal(data []byte) error {
+func (p *Channel) Unmarshal(data []byte) error {
 	parsed, err := ParseChannelData(data)
 	if err != nil {
 		return err
@@ -55,12 +55,12 @@ func (p *ChannelData) Unmarshal(data []byte) error {
 
 	return nil
 }
-func (p *ChannelData) Type() uint8 {
+func (p *Channel) Type() uint8 {
 	return MsgChanneledData
 }
 
-func ParseChannelData(data []byte) (*ChannelData, error) {
-	cd := &ChannelData{}
+func ParseChannelData(data []byte) (*Channel, error) {
+	cd := &Channel{}
 	offset := 0
 
 	if len(data) < offset+4 {
@@ -83,7 +83,7 @@ func ParseChannelData(data []byte) (*ChannelData, error) {
 	return cd, nil
 }
 
-func (cd *ChannelData) Marshal() []byte {
+func (cd *Channel) Marshal() []byte {
 	out := make([]byte, 8+len(cd.Data)) //4 Id + 4 len + data len
 	binary.BigEndian.PutUint32(out[0:4], cd.ChannelID)
 	binary.BigEndian.PutUint32(out[4:8], uint32(len(cd.Data)))
