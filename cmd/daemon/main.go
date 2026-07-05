@@ -24,6 +24,7 @@ type JSONDaemonConfig struct {
 	MaxContainersConnectionsAllowed uint32   `json:"MaxContainersConnectionsAllowed"`
 	EnvironmentsJsonConfig          string   `json:"EnvironmentsJsonConfig"`
 	DatabaseDirectory               string   `json:"DatabaseDirectory"`
+	HostKeyPath                     string   `json:"HostKeyPath"`
 }
 
 // LoadDaemonConfig reads the JSON file from disk and parses it [1, 2]

@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.uber.org/atomic"
@@ -60,6 +62,8 @@ type DaemonConfig struct {
 	EnvironmentsJsonConfig string
 	DatabaseDir            string
 	ClientInitHandler      func(ctx context.Context, msg []byte) bool
+
+	HostKeyPath string // defaults to /etc/shellforge/host_ed25519 if empty
 }
 
 type Daemon struct {
@@ -78,6 +82,8 @@ type Daemon struct {
 	AllowedKeys map[string]AccessKeyRecord
 	State       *DaemonState
 
+	HostKey ed25519.PrivateKey
+
 	ctx    context.Context
 	Cancel context.CancelFunc
 }
@@ -92,7 +98,7 @@ type DaemonState struct {
 	UserShellCount map[string]uint8    //map of a user to number of active shells, used to enforce max shell per user limits
 }
 
-// listen loop
+// main loop
 func (d *Daemon) listen() {
 
 	// 2. Run an initial active purge immediately on startup
@@ -120,11 +126,17 @@ func (d *Daemon) listen() {
 
 	handler := func(parentCtx context.Context, fd net.Conn) {
 		defer fd.Close()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC] recovered in connection handler for %v: %v", fd.RemoteAddr(), r)
+			}
+		}()
 
 		if d.State.connections.Load() >= d.Conf.MaxConnectionsAllowed && d.Conf.MaxConnectionsAllowed != 0 {
 			log.Printf("max connections reached, no other client conns allowed")
 			return
 		}
+
 		d.State.connections.Add(1)
 		defer d.State.connections.Sub(1)
 		// Create a connection-specific cancelable context
@@ -178,13 +190,11 @@ func (d *Daemon) listen() {
 		// ==========================================
 		cHelloPkt, err := session.ReadPacket()
 		if err != nil {
-
+			log.Println(err)
 			return
 		}
-
 		if cHelloPkt.Payload[0] != MsgClientHello {
 			session.WritePacket(MsgServerExpectedClientHello, nil)
-
 			return
 		}
 
@@ -196,61 +206,27 @@ func (d *Daemon) listen() {
 			return
 		}
 
-		// ==========================================
-		// PHASE 3: KEY EXCHANGE & ENCRYPTION
-		// ==========================================
-		if cHello.SessLen != 0 {
-			// used for sess resume -- not allowed for now
-			log.Printf("Client attempting to resume Session: %x", cHello.SessionID)
-			log.Println("Session expired or invalid. Forcing full reconnect.")
-			session.WritePacket(MsgServerClientHelloRejected, nil)
-			return
-		}
-
-		// Generate 32-byte Session ID
-		newSessionID := generateSessionID(32)
-		log.Printf("session id generated, %x", newSessionID)
-
-		//encrypt the session
-		enc, dec, serverShareKey, err := d.encryptSession(cHello, session, newSessionID)
+		enc, dec, serverHello, err := d.HandShake(session, cHello)
 		if err != nil {
-			log.Printf("Faild to encrypt the session, %v", err)
+			log.Printf("handshake failed: %v", err)
+			session.WritePacket(MsgServerEncryptionHandShakeFailed, serverHello.Marshal())
 			return
 		}
 
-		// 7. Save session state
-		session.ID = newSessionID
-		d.State.SaveSession(newSessionID, session)
 		defer d.State.DeleteSession(session.ID)
-
-		sh := &ServerHello{
-			SessionResumed:    false,
-			SessLen:           uint16(len(newSessionID)),
-			SessionID:         newSessionID,
-			EncryptionSupport: true,
-			Encryption: ServerHelloEncryptionFields{
-				ServerSharekeyLen: uint16(len(serverShareKey)),
-				Server_Share_key:  serverShareKey, //pub key if KexX25519 | Public Key + ML-KEM Ciphertext if KexHybridX25519MLKEM768
-			},
-			SupportedAuths: d.supportedAuths, // <--- ADVERTISE
-
-		}
-
-		log.Printf("Server Hello Packet Created and sent, %x", newSessionID)
-
-		err = session.WritePacket(MsgServerHello, sh.Marshal())
+		err = session.WritePacket(MsgServerHello, serverHello.Marshal())
 		if err != nil {
 			log.Printf("failed to send ServerHello: %v", err)
 			return
 		}
-
+		log.Printf("Server Hello Packet Created and sent, with session ID: %x", session.ID)
 		// 9. Setup the Encrypter/Decrypter based on client's selected cipher
 
-		// messages are encrypted from now on
+		// messages are encrypted from now on //session encrypted
 		session.encrypter = enc
 		session.decrypter = dec
 
-		log.Printf("Secure Session Established! ID: %x", newSessionID)
+		log.Printf("Secure Session Established! session ID: %x", session.ID)
 
 		//temp shell connection hijack //temp sessions dont follow regular auth steps
 		//if cHello.HasHeader(TEMPSHELL_SESSION_HEADER_KEY) {
@@ -374,7 +350,7 @@ func (d *Daemon) listen() {
 
 			d.shellLoop(connCtx, session)
 			return
-		case MsgClientGetContainer:
+		case MsgClientConnectContainer:
 
 			eReq, err := ParseENVRequest(pkt.Payload[1:])
 			if err != nil {
@@ -382,7 +358,7 @@ func (d *Daemon) listen() {
 			}
 
 			if !ed25519.Verify(eReq.PublicKey, session.ID, eReq.Signature) {
-				log.Printf("cant verify sig")
+				log.Printf("cant verify the sig")
 				session.WritePacket(MsgServerInvalidSignature, nil)
 				return
 			}
@@ -396,7 +372,7 @@ func (d *Daemon) listen() {
 			pubKeyHex := hex.EncodeToString(eReq.PublicKey)
 
 			if !d.DB.HasActiveEnv(pubKeyHex, "container") || !d.DB.IsEligibleKey(pubKeyHex) {
-				log.Printf("no container fot this key %s", string(eReq.PublicKey))
+				log.Printf("no container fot this key %s", pubKeyHex)
 				session.WritePacket(MsgServerNoContainer, nil)
 				return
 			}
@@ -435,57 +411,11 @@ func (d *Daemon) listen() {
 					log.Printf("max container connections reached, no other client conns allowed")
 					return
 				}
-
-			}
-			env, err := d.DB.GetENVByUserReqestedName(string(eReq.UserRequestedName), pubKeyHex)
-			if err != nil {
-				log.Println("asdsadd")
-				log.Println(err)
-				return
-			}
-			if env == nil {
-				log.Printf("%s doenst exist or belong to this user", string(eReq.UserRequestedName))
-				session.WritePacket(MsgServerNoContainer, nil)
-				return
-			}
-
-			if env != nil {
-				chanID := session.IncrementChannelID()
-
-				log.Printf("New Channel for container Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
-
-				pipeStream := NewPipe(chanID, session)
-				session.AddActiveChannel(chanID, pipeStream)
-
-				runCh := make(chan struct{}, 1)
-				go func() {
-					defer session.DeleteActiveChannel(chanID)
-					defer pipeStream.Close()
-
-					err := d.RunContainer(connCtx, runCh, env, 24, 80, pipeStream)
-					if err != nil {
-						log.Printf("[ERROR RunContainer] %v\n for container %s", err, env.Name)
-						return
-					}
-				}()
-
-				<-runCh
-
-				srr := &ShellRequestResponse{
-					RequestID: eReq.RequestID, // Matches the client's request
-					ChannelID: chanID,         // ASSIGNED BY THE SERVER!
-					Success:   true,
-				}
-
-				err = session.WritePacket(MsgServerShellReqResponse, srr.Marshal())
-				if err != nil {
-					return
-				}
-
-				log.Printf("container running")
-
+				log.Printf("container loop running")
+				session.PublicKey = eReq.PublicKey
 				d.ContainerLoop(connCtx, session)
 			}
+
 		default:
 			log.Printf("invalid request")
 			return
@@ -516,6 +446,71 @@ func (d *Daemon) listen() {
 	opts.Listen(address, handler)
 
 }
+
+func (d *Daemon) HandShake(session *Session, cHello *ClientHello) (encrypter, decrypter cipher.AEAD, serverHello *ServerHello, err error) {
+
+	// ==========================================
+	// PHASE 3: KEY EXCHANGE & ENCRYPTION
+	// ==========================================
+	if cHello.SessLen != 0 {
+		// used for sess resume -- not allowed for now
+		log.Printf("Client attempting to resume Session: %x", cHello.SessionID)
+		log.Println("Session expired or invalid. Forcing full reconnect.")
+		//session.WritePacket(MsgServerClientHelloRejected, nil)
+		return nil, nil, nil, errors.New("session expired or invalid")
+	}
+
+	// Generate 32-byte Session ID
+	newSessionID := generateSessionID(32)
+	log.Printf("session id generated, %x", newSessionID)
+
+	//encrypt the session
+	enc, dec, serverShareKey, err := encryptSession(cHello, session, newSessionID)
+	if err != nil {
+		log.Printf("Faild to encrypt the session, %v", err)
+		return nil, nil, nil, err
+	}
+
+	// 7. Save session state
+	session.ID = newSessionID
+	d.State.SaveSession(newSessionID, session)
+	//defer d.State.DeleteSession(session.ID)
+
+	sh := &ServerHello{
+		SessionResumed:    false,
+		SessLen:           uint16(len(newSessionID)),
+		SessionID:         newSessionID,
+		EncryptionSupport: true,
+		Encryption: ServerHelloEncryptionFields{
+			ServerSharekeyLen: uint16(len(serverShareKey)),
+			Server_Share_key:  serverShareKey, //pub key if KexX25519 | Public Key + ML-KEM Ciphertext if KexHybridX25519MLKEM768
+		},
+		SupportedAuths: d.supportedAuths, // <--- ADVERTISE
+
+	}
+
+	transcript := BuildHandshakeTranscript(
+		cHello.ClientRandom,
+		newSessionID,
+		cHello.Encryption.CLIENT_KEX_ALGO,
+		cHello.Encryption.CLIENT_CIPHER,
+		serverShareKey,
+	)
+
+	hostPub := d.HostKey.Public().(ed25519.PublicKey)
+	hostSig := ed25519.Sign(d.HostKey, transcript)
+	sh.AddHeader([]byte(HostKeyHeaderKey), []byte(hostPub))
+	sh.AddHeader([]byte(HostSigHeaderKey), hostSig)
+
+	// 9. Setup the Encrypter/Decrypter based on client's selected cipher
+
+	// messages are encrypted from now on
+	//session.encrypter = enc
+	//session.decrypter = dec
+
+	return enc, dec, sh, nil
+}
+
 func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 	d.State.ContainerConns.Add(1)
 	defer d.State.ContainerConns.Sub(1)
@@ -531,6 +526,169 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 		}
 
 		switch pkt.Payload[0] {
+		case MsgClientGetContainerShell:
+			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
+
+			if cop.OpType != ContainerOpShell {
+				return
+			}
+
+			log.Printf("Received [container] Shell Request for container [%s] by [%s]- Req id %v", string(cop.Name), string(cop.PublicKey), cop.RequestID)
+			if err != nil {
+				session.WritePacket(MsgServerFailedToOpenShell, nil)
+				continue
+			}
+			pubKeyHex := hex.EncodeToString(cop.PublicKey)
+			// 2. Daemon is authoritative! It assigns the Channel ID safely.
+			chanID := session.IncrementChannelID()
+			log.Printf("New Channel Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
+
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if env == nil {
+				log.Printf("%s doesn't exist or belong to this key", string(cop.Name))
+				session.WritePacket(MsgServerNoContainer, nil)
+				return
+			}
+
+			if env != nil {
+				pipeStream := NewPipe(chanID, session)
+				session.AddActiveChannel(chanID, pipeStream)
+
+				runCh := make(chan struct{}, 1)
+				go func() {
+					defer session.DeleteActiveChannel(chanID)
+					defer pipeStream.Close()
+
+					err := d.RunContainer(ctx, runCh, env, 24, 80, pipeStream)
+					if err != nil {
+						log.Printf("[ERROR RunContainer] %v\n for container %s", err, env.Name)
+						return
+					}
+				}()
+
+				<-runCh
+
+				srr := &ShellRequestResponse{
+					RequestID: cop.RequestID, // Matches the client's request
+					ChannelID: chanID,        // ASSIGNED BY THE SERVER!
+					Success:   true,
+				}
+
+				err = session.WritePacket(MsgServerShellReqResponse, srr.Marshal())
+				if err != nil {
+					return
+				}
+			}
+
+		case MsgClientContainerLog:
+			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
+			if err != nil {
+				session.WritePacket(MsgServerFailedToOpenShell, nil)
+				continue
+			}
+			if cop.OpType != ContainerOpLogs {
+				log.Printf("invaild containerOp code")
+				return
+			}
+			pubKeyHex := hex.EncodeToString(cop.PublicKey)
+			log.Printf("[container] log Request for container [%s] by [%s]- Req id %v", string(cop.Name), pubKeyHex, cop.RequestID)
+
+			chanID := session.IncrementChannelID()
+
+			log.Printf("New Channel Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if env == nil {
+				log.Printf("%s doesn't exist or belong to this key", string(cop.Name))
+				session.WritePacket(MsgServerNoContainer, nil)
+				return
+			}
+			pipeStream := NewPipe(chanID, session)
+
+			co := &ChannelOpen{
+				ChannelID: chanID,
+			}
+
+			session.WritePacket(MsgServerOpenLogChannel, co.Marshal())
+			defer session.WritePacket(MsgServerChannelClosed, co.Marshal())
+
+			session.AddActiveChannelWithConfirmation(chanID, pipeStream)
+
+			//client needs to send MsgClientChannelOpenConfirm
+			if !session.WaitForClientChannelOpenConfirmed(chanID) {
+				return
+			}
+			log.Printf("client Confirmed channel opened %d", chanID)
+
+			err = d.GetContainerLogs(ctx, env.Name, pipeStream)
+
+			if err != nil {
+				log.Println(err)
+			}
+		case MsgClientContainerCommandExec:
+			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
+			if err != nil {
+				session.WritePacket(MsgServerFailedToOpenShell, nil)
+				continue
+			}
+			if cop.OpType != ContainerOpCommand {
+				return
+			}
+
+			if cop.Command == nil || cop.CommandLen == 0 || len(cop.Command) != int(cop.CommandLen) {
+				log.Printf("bad op packet")
+				return
+			}
+
+			pubKeyHex := hex.EncodeToString(cop.PublicKey)
+			log.Printf("[container] command exec Request for container [%s] by [%s]- Req id %v", string(cop.Name), pubKeyHex, cop.RequestID)
+
+			// 2. Daemon is authoritative! It assigns the Channel ID safely.
+			chanID := session.IncrementChannelID()
+			log.Printf("New Channel Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			if env == nil {
+				log.Printf("%s doesn't exist or belong to this key", string(cop.Name))
+				session.WritePacket(MsgServerNoContainer, nil)
+				return
+			}
+
+			pipeStream := NewPipe(chanID, session)
+			session.AddActiveChannelWithConfirmation(chanID, pipeStream)
+
+			co := &ChannelOpen{
+				ChannelID: chanID,
+			}
+			session.WritePacket(MsgServerOpenReadChannel, co.Marshal())
+			defer session.WritePacket(MsgServerChannelClosed, co.Marshal())
+
+			//client needs to send MsgClientChannelOpenConfirm
+			if !session.WaitForClientChannelOpenConfirmed(chanID) {
+				return
+			}
+			log.Printf("client Confirmed channel opened %d", chanID)
+
+			command := string(cop.Command)
+			err = d.ContainerExec(ctx, env.Name, command, pipeStream)
+			if err != nil {
+				log.Println(err)
+			}
 
 		case MsgClientChanneledData:
 			// CLIENT WRITING DATA BACK TO PUBLIC USER
@@ -562,6 +720,7 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				log.Printf("Received Data with unknown Channel ID: %d", ch.ChannelID)
 				go session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
 			}
+
 		case MsgClientSessionClosed:
 			session.Close()
 			log.Printf("MsgClientSessionClosed")
@@ -649,7 +808,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 					n, err := uConn.Read(buf)
 					if n > 0 {
 
-						cd := &ChannelData{
+						cd := &Channel{
 							ChannelID: chanID,
 							Data:      buf[:n],
 						}
@@ -764,51 +923,6 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 
 			shell = sr
 
-			log.Printf("db search")
-
-			if isTempUser(string(sr.User)) && d.DB.HasActiveEnv(session.PublicKey, "system-user") {
-				env, err := d.DB.GetENVByname(string(sr.User), session.PublicKey)
-				if err == nil && env == nil {
-					log.Printf("cant get user")
-					continue
-
-				}
-
-				if err == ErrFailedToQueryByReqNmae { //temp user but falid to query
-					log.Printf("cant get user")
-					continue
-				}
-
-				shell = &ShellRequest{
-					RequestID: sr.RequestID,
-					User:      []byte(env.Name),
-					Shell:     []byte(env.Setting.Shell),
-					Row:       sr.Row,
-					Cols:      sr.Cols,
-				}
-			}
-
-			env, err := d.DB.GetENVByUserReqestedName(string(sr.User), session.PublicKey)
-
-			if err == ErrFailedToQueryByReqNmae { //temp user but falid to query
-				log.Printf("cant get user")
-				continue
-			}
-			if err != nil {
-				log.Printf("cant get user")
-				continue
-			}
-
-			if err == nil && env != nil { //is tempuser
-				shell = &ShellRequest{
-					RequestID: sr.RequestID,
-					User:      []byte(env.Name),
-					Shell:     []byte(env.Setting.Shell),
-					Row:       sr.Row,
-					Cols:      sr.Cols,
-				}
-			}
-
 			if !SysUserExists(string(shell.User)) {
 				log.Printf("not a sys user")
 				continue
@@ -846,6 +960,14 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			if err != nil {
 				continue
 			}
+
+			//reject server-namespace IDs from clients
+			if !IsClientChannelID(cco.ChannelID) {
+				log.Printf("Security alert: client tried to open channel with server-namespace ID %d; rejecting", cco.ChannelID)
+				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: cco.ChannelID}).Marshal())
+				continue
+			}
+
 			session.mu.Lock()
 			localTarget, exists := session.forwardMap[cco.RemoteAddr]
 			session.mu.Unlock()
@@ -867,7 +989,12 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 					return
 				}
 
-				session.AddActiveChannel(channelID, c)
+				if !session.AddActiveChannelIfAbsent(channelID, c) {
+					log.Printf("Security alert: client requested channel ID %d that is already in use; refusing (possible channel hijack attempt)", channelID)
+					c.Close()
+					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: channelID}).Marshal())
+					return
+				}
 				defer session.DeleteActiveChannel(channelID)
 				defer c.Close()
 
@@ -878,7 +1005,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				for {
 					n, err := c.Read(buf)
 					if n > 0 {
-						cd := &ChannelData{
+						cd := &Channel{
 							ChannelID: channelID, // Use the client's ID
 							Data:      buf[:n],
 						}
@@ -901,6 +1028,13 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 		case MsgClientChannelClosed:
 			ccl, err := ParseChannelClosed(pkt.Payload[1:])
 			if err != nil {
+				continue
+			}
+
+			//reject server-namespace IDs from clients
+			if !IsClientChannelID(ccl.ChannelID) {
+				log.Printf("Security alert: client tried to close channel with server-namespace ID %d; rejecting", ccl.ChannelID)
+				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ccl.ChannelID}).Marshal())
 				continue
 			}
 
@@ -946,7 +1080,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 }
 
 // returns enc AEAD cipher, dec, serverShareKey and error
-func (d *Daemon) encryptSession(cHello *ClientHello, session *Session, ID []byte) (cipher.AEAD, cipher.AEAD, []byte, error) {
+func encryptSession(cHello *ClientHello, session *Session, ID []byte) (cipher.AEAD, cipher.AEAD, []byte, error) {
 	// 1. Strict Enforcement: Verify we support the client's chosen KEX and Cipher [1]
 	if cHello.Encryption.CLIENT_KEX_ALGO != KexX25519 && cHello.Encryption.CLIENT_KEX_ALGO != KexHybridX25519MLKEM768 {
 		log.Printf("Unsupported Key Exchange requested: %d. Rejecting.", cHello.Encryption.CLIENT_KEX_ALGO)
@@ -1078,7 +1212,7 @@ func (d *Daemon) encryptSession(cHello *ClientHello, session *Session, ID []byte
 	return enc, dec, serverShareKey, nil
 }
 
-func (d *Daemon) shellAuth(session *Session, aPkt *WireforgePacket) (*AuthResponse, error) {
+func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error) {
 	var authUsername string
 	var user string
 	ar := &AuthResponse{Success: false}
@@ -1130,7 +1264,12 @@ func (d *Daemon) shellAuth(session *Session, aPkt *WireforgePacket) (*AuthRespon
 		}
 
 		if user != "root" && !isTempUser(user) {
-			AuthorizedKeysPath = fmt.Sprintf("home/%s/.shellforge/authorized_keys", authReq.Username)
+			p, perr := AuthorizedKeysPathForUser(authReq.Username)
+			if perr != nil {
+				log.Printf("PublicKey auth failed for user %s: %v", authReq.Username, perr)
+				return nil, perr
+			}
+			AuthorizedKeysPath = p
 		}
 
 		if d.Conf.AuthorizedKeysPath != "" {
@@ -1139,11 +1278,15 @@ func (d *Daemon) shellAuth(session *Session, aPkt *WireforgePacket) (*AuthRespon
 
 		log.Printf("authorized key dir for user %s is %s", user, AuthorizedKeysPath)
 		ok, err := VerifyClientSignature(AuthorizedKeysPath, session.ID, authReq.Signature, authReq.PublicKey)
-		if err != nil || !ok {
+		if err != nil {
 			log.Printf("PublicKey auth failed for user %s: %v", authReq.Username, err)
-			if err != nil {
-				return nil, err
-			}
+
+			return nil, err
+
+		}
+		if !ok {
+			log.Printf("PublicKey auth failed for user %s: signature not accepted", authReq.Username)
+			return nil, errors.New("public key authentication failed: signature verification rejected")
 		}
 
 		log.Printf("User [%s] successfully authenticated via Public key!", authReq.Username)
@@ -1154,7 +1297,7 @@ func (d *Daemon) shellAuth(session *Session, aPkt *WireforgePacket) (*AuthRespon
 		ar.Success = true
 
 		session.authMethod = AuthMethodPublicKey
-		session.PublicKey = string(authReq.PublicKey)
+		session.PublicKey = authReq.PublicKey
 		return ar, nil
 
 	case MsgClientAuthPassword:
@@ -1516,6 +1659,20 @@ func Start(conf DaemonConfig) {
 		State:  s,
 	}
 
+	hostKeyPath := conf.HostKeyPath
+	if hostKeyPath == "" {
+		hostKeyPath = "/etc/shellforge/host_ed25519"
+	}
+
+	hostKey, err := LoadOrCreateHostKey(hostKeyPath)
+
+	if err != nil {
+		log.Fatalf("Failed to load/create host key: %v", err)
+	}
+	d.HostKey = hostKey
+
+	log.Printf("[Daemon] Host key loaded from %s; public key: %x", hostKeyPath, hostKey.Public().(ed25519.PublicKey))
+
 	// Calculate supported auth bitmask dynamically
 	var supportedAuths uint8 = 0
 
@@ -1631,9 +1788,7 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, env *ENVs,
 	state := getContainerState(env.Name)
 	log.Printf("[Container] Current state of %s: %q", env.Name, state)
 
-	if !env.Setting.StopAfterExit && !env.Setting.KillAfterExit {
-		ctx = context.Background()
-	}
+	leaveRunning := !env.Setting.StopAfterExit && !env.Setting.KillAfterExit
 
 	var cmd *exec.Cmd
 
@@ -1714,6 +1869,9 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, env *ENVs,
 		return fmt.Errorf("container %s is in unexpected state %q, manual intervention required", env.Name, state)
 	}
 
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 5 * time.Second
+
 	// 2. Spawn the container inside the PTY [3]
 	ptyFd, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
 	if err != nil {
@@ -1726,6 +1884,12 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, env *ENVs,
 	if pipe, ok := ch.(*PipeStream); ok {
 		pipe.SetPTY(ptyFd)
 		defer pipe.SetPTY(nil)
+	}
+	// Wait until the runtime actually reports "running" before signaling
+	// readiness — pty start only means the podman *process* spawned.
+	if err := waitForContainerState(ctx, env.Name, "running", 10*time.Second); err != nil {
+		close(run)
+		return fmt.Errorf("container %s failed to reach running state: %w", env.Name, err)
 	}
 
 	log.Printf("[Container] pty started: %s", env.Name)
@@ -1740,48 +1904,268 @@ func (d *Daemon) RunContainer(ctx context.Context, run chan struct{}, env *ENVs,
 		_, err := io.Copy(ch, ptyFd)
 		errCh <- err
 	}()
-	var exerr error
-	select {
-	case <-ctx.Done():
-		// Gracefully stop the container instead of killing it,
-		// allowing internal database/file writes to finish cleanly [4].
-		if env.Setting.KillAfterExit {
+
+	applyExitPolicy := func() {
+		switch {
+		case env.Setting.KillAfterExit:
 			log.Printf("[Container] killing container on exit %s...", env.Name)
 			_ = exec.Command("podman", "kill", "--signal", "SIGKILL", env.Name).Run()
-
-		}
-
-		if !env.Setting.KillAfterExit && env.Setting.StopAfterExit {
+		case env.Setting.StopAfterExit:
 			log.Printf("[Container] Gracefully stopping container %s...", env.Name)
 			_ = exec.Command("podman", "stop", "-t", "5", env.Name).Run()
+		case leaveRunning:
+			log.Printf("[Container] container %s stays running in the background", env.Name)
 		}
+	}
 
+	select {
+	case <-ctx.Done():
+		// Client disconnected or daemon is shutting down. Tear down OUR side:
+		// CommandContext already signaled the podman attach client (see
+		// cmd.Cancel above), the deferred ptyFd.Close() unblocks both io.Copy
+		// goroutines, and cmd.Wait() reaps the child so nothing accumulates.
+		applyExitPolicy()
+		_ = cmd.Wait()
 		log.Printf("[Container] loop exit for %s...", env.Name)
 		return ctx.Err()
 	case err := <-errCh:
-
-		exerr = err
-
+		// The PTY or the client pipe ended on its own (e.g. user typed "exit").
 		log.Printf("[Container] %v\n", err)
-
-		if env.Setting.KillAfterExit {
-			log.Printf("[Container] killing container on exit %s...", env.Name)
-			_ = exec.Command("podman", "kill", "--signal", "SIGKILL", env.Name).Run()
-
-		}
-
-		if !env.Setting.KillAfterExit && env.Setting.StopAfterExit {
-			log.Printf("[Container] Gracefully stopping container %s...", env.Name)
-			_ = exec.Command("podman", "stop", "-t", "5", env.Name).Run()
-		}
-
-	}
-
-	if exerr == nil {
-		if !env.Setting.StopAfterExit && !env.Setting.KillAfterExit {
-			log.Printf("[Container] container %s... stays running in the background", env.Name)
-		}
+		applyExitPolicy()
 	}
 
 	return cmd.Wait()
+}
+
+// =====================================================================
+// CONTAINER OBSERVATION FUNCTIONS
+// =====================================================================
+
+// PodmanStats is the struct podman emits per-container from
+// `podman stats --no-stream --format json`.
+type PodmanStats struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	CPUPerc  string `json:"cpu_percent"`
+	MemUsage string `json:"mem_usage"`
+	MemPerc  string `json:"mem_percent"`
+	NetIO    string `json:"net_io"`
+	BlockIO  string `json:"block_io"`
+	PIDs     uint64 `json:"pids"`
+}
+
+// PodmanInspectResult is a subset of the rich JSON podman inspect returns.
+// Extend the fields here if you need more detail surfaced to the client.
+type PodmanInspectResult struct {
+	ID      string `json:"Id"`
+	Name    string `json:"Name"`
+	Created string `json:"Created"`
+	State   struct {
+		Status     string    `json:"Status"`
+		Running    bool      `json:"Running"`
+		Paused     bool      `json:"Paused"`
+		StartedAt  time.Time `json:"StartedAt"`
+		FinishedAt time.Time `json:"FinishedAt"`
+		ExitCode   int       `json:"ExitCode"`
+	} `json:"State"`
+	Config struct {
+		Image  string            `json:"Image"`
+		Env    []string          `json:"Env"`
+		Labels map[string]string `json:"Labels"`
+		Cmd    []string          `json:"Cmd"`
+	} `json:"Config"`
+	HostConfig struct {
+		Memory   int64 `json:"Memory"`
+		NanoCPUs int64 `json:"NanoCpus"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		IPAddress string `json:"IPAddress"`
+	} `json:"NetworkSettings"`
+	Mounts []struct {
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		Mode        string `json:"Mode"`
+	} `json:"Mounts"`
+}
+
+// GetContainerLogs streams the stdout+stderr of the named container back into w.
+// Equivalent to: podman logs --timestamps <containerName>
+func (d *Daemon) GetContainerLogs(ctx context.Context, containerName string, w io.Writer) error {
+	state := getContainerState(containerName)
+	if state == "" {
+		return fmt.Errorf("container %q does not exist", containerName)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "podman", "logs", "--timestamps", containerName)
+	cmd.Stdout = w
+	cmd.Stderr = &stderr // podman logs writes to stderr too, capture separately
+
+	if err := cmd.Run(); err != nil {
+		podmanErr := strings.TrimSpace(stderr.String())
+		if podmanErr != "" {
+			return fmt.Errorf("podman logs failed: %w (stderr: %s)", err, podmanErr)
+		}
+		return fmt.Errorf("podman logs failed: %w", err)
+	}
+
+	// podman logs writes actual log lines to stderr (not stdout) by default —
+	// flush stderr content to w as well so the caller gets everything.
+	if stderr.Len() > 0 {
+		_, _ = w.Write(stderr.Bytes())
+	}
+	return nil
+}
+
+// GetStats returns a single point-in-time snapshot of resource usage for
+// the named container. The container must be running.
+// Equivalent to: podman stats --no-stream --format json <containerName>
+func (d *Daemon) GetContainerStats(ctx context.Context, containerName string) (*PodmanStats, error) {
+	state := getContainerState(containerName)
+	if state == "" {
+		return nil, fmt.Errorf("container %q does not exist", containerName)
+	}
+	if state != "running" {
+		return nil, fmt.Errorf("container %q is not running (state: %s): stats require a running container", containerName, state)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "podman", "stats",
+		"--no-stream",
+		"--format", "json",
+		containerName,
+	)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("podman stats failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// podman stats --format json wraps results in an array even for one container.
+	var results []PodmanStats
+	if err := json.Unmarshal(stdout.Bytes(), &results); err != nil {
+		return nil, fmt.Errorf("failed to parse podman stats output: %w (raw: %s)", err, stdout.String())
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("podman stats returned empty result for %q", containerName)
+	}
+	return &results[0], nil
+}
+
+// GetInspect returns detailed metadata about a container (running or stopped).
+// Equivalent to: podman inspect <containerName>
+func (d *Daemon) GetContainerInspect(ctx context.Context, containerName string) (*PodmanInspectResult, error) {
+	state := getContainerState(containerName)
+	if state == "" {
+		return nil, fmt.Errorf("container %q does not exist", containerName)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "podman", "inspect", containerName)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("podman inspect failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// podman inspect always returns a JSON array.
+	var results []PodmanInspectResult
+	if err := json.Unmarshal(stdout.Bytes(), &results); err != nil {
+		return nil, fmt.Errorf("failed to parse podman inspect output: %w", err)
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("podman inspect returned empty result for %q", containerName)
+	}
+	return &results[0], nil
+}
+
+// GetTop returns the process list inside the container, formatted as a
+// human-readable table, streamed into w.
+// Equivalent to: podman top <containerName>
+func (d *Daemon) GetContainerTop(ctx context.Context, containerName string, w io.Writer) error {
+	state := getContainerState(containerName)
+	if state == "" {
+		return fmt.Errorf("container %q does not exist", containerName)
+	}
+	if state != "running" {
+		return fmt.Errorf("container %q is not running (state: %s): top requires a running container", containerName, state)
+	}
+
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "podman", "top", containerName,
+		// Extra ps columns for more useful output than the default.
+		"pid", "ppid", "user", "pcpu", "pmem", "etime", "args",
+	)
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("podman top failed: %w (stderr: %s)", err, stderr.String())
+	}
+	return nil
+}
+
+// ContainerExec runs a single non-interactive command inside a running
+// container and streams its combined stdout+stderr back into w.
+// Equivalent to: podman exec <containerName> <command...>
+// The commandStr is split on spaces — if you need shell features like pipes
+// or redirects, wrap in sh -c: ContainerExec(ctx, name, "sh -c 'cat /a | grep b'", w)
+func (d *Daemon) ContainerExec(ctx context.Context, containerName, commandStr string, w io.Writer) error {
+	if strings.TrimSpace(commandStr) == "" {
+		fmt.Fprintf(w, "command string must not be empty")
+		return fmt.Errorf("command string must not be empty")
+	}
+
+	state := getContainerState(containerName)
+	if state == "" {
+		fmt.Fprintf(w, "container %q does not exist", containerName)
+		return fmt.Errorf("container %q does not exist", containerName)
+	}
+
+	// Ensure the container is actually accepting exec sessions.
+	// NOTE: even if inspect says "running", a start may still be settling,
+	// so we always wait rather than trusting a single snapshot.
+	if state != "running" {
+		// Idempotent: if a concurrent resume (RunContainer) already started
+		// it, this is a no-op / harmless error we can ignore.
+		startCmd := exec.CommandContext(ctx, "podman", "start", containerName)
+		var startErr bytes.Buffer
+		startCmd.Stderr = &startErr
+		if err := startCmd.Run(); err != nil {
+			log.Printf("[exec] podman start %s: %v (stderr: %s) — waiting anyway, a concurrent start may be in flight",
+				containerName, err, strings.TrimSpace(startErr.String()))
+		}
+	}
+	if err := waitForContainerState(ctx, containerName, "running", 10*time.Second); err != nil {
+		fmt.Fprintf(w, "container %q did not reach running state: %v", containerName, err)
+		return err
+	}
+
+	parts := strings.Fields(commandStr)
+	args := append([]string{"exec", "-t", containerName}, parts...)
+
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	//cmd.Stdin = w
+	cmd.Stdout = w
+	cmd.Stderr = &stderr // capture separately; merge into w after run
+
+	if err := cmd.Run(); err != nil {
+		podmanErr := strings.TrimSpace(stderr.String())
+		// Non-zero exit from the *command inside the container* is normal —
+		// surface it with stderr so the client sees the actual error output.
+		_, _ = fmt.Fprintf(w, "\n[exec error] %v\n", err)
+		if podmanErr != "" {
+			_, _ = fmt.Fprintf(w, "[stderr] %s\n", podmanErr)
+		}
+		return fmt.Errorf("exec %q in %s exited non-zero: %w", commandStr, containerName, err)
+	}
+
+	// Flush any stderr the command wrote (e.g. warnings from the program itself).
+	if stderr.Len() > 0 {
+		_, _ = w.Write(stderr.Bytes())
+	}
+	return nil
 }

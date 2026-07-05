@@ -16,6 +16,12 @@ import (
 
 var ErrCanNotParseMalformedPacket = errors.New("ErrCanNotParseMalformedPacket")
 
+// We partition the 32-bit ID space using the top bit, and both peers agree on
+// the full 32-bit ID (namespace bit included) on the wire:
+//   - server-initiated IDs: high bit CLEAR (0x0000_0001 .. 0x7FFF_FFFF)
+//   - client-initiated IDs: high bit SET   (0x8000_0001 .. 0xFFFF_FFFF)
+const ClientChannelIDBit uint32 = 1 << 31
+const CHANNEL_CONFIRM_TIMEOUT = 5 * time.Second
 const (
 	AuthMethodPassword  uint8 = 0x01 // 1 << 0 (0000 0001) - Password/PAM
 	AuthMethodPublicKey uint8 = 0x02 // 1 << 1 (0000 0010) - Raw Ed25519
@@ -34,13 +40,11 @@ const (
 )
 
 const (
-	MAX_PACKET_LEN               uint32        = 64 * 1024 //defu 64kb
-	MIN_PACKET_LEN               uint32        = 4         // Minimum packet size to prevent abuse (e.g., empty packets)
-	MAX_AUTH_RETRY               uint8         = 5
-	TEMPSHELL_SESSION_HEADER_KEY string        = "tempSession" //included in client hello headers
-	TEMPSHELL_USER_PREFIX        string        = "wf_tmp_"
-	PIPE_BUFFER_SIZE             uint32        = (4 * 1024)
-	CLEANUP_INTERVAL             time.Duration = 5 * time.Minute
+	MAX_PACKET_LEN uint32 = 64 * 1024 //defu 64kb
+	MIN_PACKET_LEN uint32 = 4         // Minimum packet size to prevent abuse (e.g., empty packets)
+	MAX_AUTH_RETRY uint8  = 5
+	//PIPE_BUFFER_SIZE uint32        = (4 * 1024) //4kb
+	CLEANUP_INTERVAL time.Duration = 5 * time.Minute
 )
 
 // Message Types
@@ -104,7 +108,11 @@ const (
 	MsgServerFailedToCreateTempSysUser       = 29
 	MsgServerENVRequestResponse              = 23
 	MsgServerFailedToCreateContainer         = 38
-	MsgClientGetContainer                    = 39
+	MsgClientConnectContainer                = 39
+	MsgClientGetContainerShell               = 44
+	MsgClientContainerCommandExec            = 48
+	MsgClientContainerLog                    = 49
+	MsgClientContainerOpRequest              = 47
 	MsgServerContainersListResponse          = 40
 	MsgServerENVCreated                      = 41
 	MsgServerInvalidEnvType                  = 42
@@ -139,9 +147,11 @@ const (
 
 	MsgServer = 8
 	MsgClient = 9
+
+	MsgServerOpenReadChannel = 212
 )
 
-type WireforgePacket struct {
+type Packet struct {
 	PacketLength uint32
 
 	PaddingLength uint8
@@ -157,90 +167,95 @@ type Payload struct {
 
 // represents an acctive connection between a client and server,and server and client
 type Session struct {
-	ID       []byte
-	User     string // Stores the validated username // session.AuthorizedUser
-	isDaemon bool   // 1=daemon , 0 = client
+	ID   []byte
+	User string // Stores the validated username // session.AuthorizedUser
 
-	conn net.Conn //connection between server <-> client
+	isDaemon bool     // 1=daemon , 0 = client
+	conn     net.Conn //connection between server <-> client
 
 	// Multiplexing
-	channelCounter   atomic.Uint32
-	activeChannelsMu sync.RWMutex
-	activeChannels   map[uint32]io.ReadWriteCloser //map[chanID]*pipe map[chanID]net.conn  //connection between server/client and their users/io devices
-
+	channelCounter       atomic.Uint32
+	activeChannelsMu     sync.RWMutex
+	activeChannels       map[uint32]io.ReadWriteCloser //map[chanID]*pipe map[chanID]net.conn  //connection between server/client and their users/io devices
+	channelOpenConfirmed map[uint32]bool               // Tracks which channels have been confirmed open by client
+	ConfirmChannelsMu    sync.RWMutex
 	// Cryptography
-	writeSeq  uint64 // Tracks packets sent
-	readSeq   uint64 // Tracks packets received
 	encrypter cipher.AEAD
 	decrypter cipher.AEAD
 
-	authMethod uint8 //publicKey, Password, PKI
-	PublicKey  string
+	writeSeq uint64 // Tracks packets sent
+	readSeq  uint64 // Tracks packets received
+
+	rdLen   [4]byte // stack-ish, no heap alloc
+	rdNonce []byte  // allocated once == decrypter.NonceSize()
+	rdBuf   []byte  // reused, cap == MAX_PACKET_LEN
+
+	writeMu sync.Mutex // Serializes seq++ -> Seal -> conn.Write so concurrent writers can't reuse a nonce or interleave frames
+	wrNonce []byte
+	wrPlain []byte
+	wrOut   []byte
+
+	authMethod uint8             //publicKey, Password, PKI
+	PublicKey  []byte            // 32 bytes (Ed25519) //used for session resume proof]
 	forwardMap map[string]string // Maps Remote Requested Port -> Local Target Port
 	shells     []*Shell
 	mu         sync.Mutex // Protects the TCP connection swap for session resume and close
 	closeOnce  sync.Once
 
 	Closed chan struct{} // Signals when the session is closed (used by Dialer to unblock)
+
 }
 
 func NewSession(conn net.Conn) *Session {
 	return &Session{
-		conn:           conn,
-		activeChannels: make(map[uint32]io.ReadWriteCloser),
-		forwardMap:     make(map[string]string),
-		Closed:         make(chan struct{}),
+		conn:                 conn,
+		activeChannels:       make(map[uint32]io.ReadWriteCloser),
+		channelOpenConfirmed: make(map[uint32]bool),
+		forwardMap:           make(map[string]string),
+		Closed:               make(chan struct{}),
 	}
 }
 
-func (s *Session) ReadPacket() (*WireforgePacket, error) {
+func (s *Session) ReadPacket() (*Packet, error) {
 
-	currentConn := s.getConn()
-
-	if currentConn == nil {
+	conn := s.getConn()
+	if conn == nil {
 		return nil, errors.New("session has no active connection")
 	}
-	// 1. Read the 4-byte Length Header
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(currentConn, lenBuf); err != nil {
+
+	if _, err := io.ReadFull(conn, s.rdLen[:]); err != nil {
 		return nil, err
 	}
-	pktLen := binary.BigEndian.Uint32(lenBuf)
-
-	// Protect against massive malicious packets
+	pktLen := binary.BigEndian.Uint32(s.rdLen[:])
 	if pktLen > MAX_PACKET_LEN {
 		return nil, fmt.Errorf("packet too large: %d", pktLen)
 	}
-
 	if pktLen < MIN_PACKET_LEN {
-		return nil, errors.New("packet too short, missing padding length")
+		return nil, errors.New("packet too short")
 	}
 
-	// 2. Read the rest of the packet (Ciphertext + MAC)
-	dataBuf := make([]byte, pktLen)
-	if _, err := io.ReadFull(s.conn, dataBuf); err != nil {
+	if cap(s.rdBuf) < int(pktLen) {
+		s.rdBuf = make([]byte, MAX_PACKET_LEN) // one-time, then reused
+	}
+	dataBuf := s.rdBuf[:pktLen]
+	if _, err := io.ReadFull(conn, dataBuf); err != nil {
 		return nil, err
 	}
 
 	var plaintext []byte
-
-	// 3. Decrypt the block if we have an active cipher
 	if s.decrypter != nil {
-		// Create the 12-byte Nonce using the Read Sequence Number
-		nonce := make([]byte, s.decrypter.NonceSize())
-		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], s.readSeq)
+		if s.rdNonce == nil {
+			s.rdNonce = make([]byte, s.decrypter.NonceSize())
+		}
+		binary.BigEndian.PutUint64(s.rdNonce[len(s.rdNonce)-8:], s.readSeq)
 		s.readSeq++
-
-		// Open automatically decrypts the data AND verifies the MAC signature.
-		// We pass lenBuf as 'AAD' (Associated Data). If a hacker alters the 4-byte
-		// length header in transit, Open() will instantly fail and drop the packet!
 		var err error
-		plaintext, err = s.decrypter.Open(nil, nonce, dataBuf, lenBuf)
+		plaintext, err = s.decrypter.Open(dataBuf[:0], s.rdNonce, dataBuf, s.rdLen[:])
 		if err != nil {
 			return nil, fmt.Errorf("decryption/MAC failure (tampered packet): %w", err)
 		}
 	} else {
-		plaintext = dataBuf // Unencrypted phase (e.g. ClientHello)
+		plaintext = dataBuf
 	}
 
 	// 4. Parse the unencrypted block
@@ -256,7 +271,17 @@ func (s *Session) ReadPacket() (*WireforgePacket, error) {
 	payload := plaintext[1 : len(plaintext)-int(padLen)]
 	padding := plaintext[len(plaintext)-int(padLen):]
 
-	return &WireforgePacket{
+	// A well-formed packet always carries at least the 1-byte message type as
+	// the first payload byte. Reject empty payloads here at the framing layer so
+	// every downstream handler can safely read pkt.Payload[0] without an
+	// index-out-of-range panic. This path is reachable pre-authentication (the
+	// Phase 1 init read), and an unrecovered panic in a per-connection goroutine
+	// would otherwise crash the ENTIRE daemon process (remote DoS).
+	if len(payload) < 1 {
+		return nil, errors.New("packet too short, missing message type byte")
+	}
+
+	return &Packet{
 		PacketLength:  pktLen,
 		PaddingLength: padLen,
 		Payload:       payload,
@@ -267,6 +292,9 @@ func (s *Session) ReadPacket() (*WireforgePacket, error) {
 
 // WritePacket frames the payload, encrypts it, and sends it over the TCP socket.
 func (s *Session) WritePacket(msgType uint8, data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	payload := append([]byte{msgType}, data...)
 
 	// 1. Calculate padding (Pad out to nearest 8-byte boundary to hide traffic signatures)
@@ -327,8 +355,76 @@ func (s *Session) WritePacket(msgType uint8, data []byte) error {
 	return err
 }
 
+func (s *Session) writeChannelData(msgType uint8, channelID uint32, data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// payload = [msgType(1)][channelID(4)][dataLen(4)][data]
+	payloadLen := 1 + 8 + len(data)
+	padLen := uint8(8 - ((payloadLen + 1) % 8))
+	plainLen := 1 + payloadLen + int(padLen) // [padLen] + payload + padding
+
+	if cap(s.wrPlain) < plainLen {
+		s.wrPlain = make([]byte, plainLen)
+	}
+	p := s.wrPlain[:plainLen]
+	p[0] = padLen
+	p[1] = msgType
+	binary.BigEndian.PutUint32(p[2:6], channelID)
+	binary.BigEndian.PutUint32(p[6:10], uint32(len(data)))
+	copy(p[10:10+len(data)], data) // the ONLY data copy
+	if padLen > 0 {
+		if _, err := rand.Read(p[plainLen-int(padLen):]); err != nil {
+			return err
+		}
+	}
+
+	pktLen := plainLen + s.encrypter.Overhead()
+	if cap(s.wrOut) < 4+pktLen {
+		s.wrOut = make([]byte, 4+pktLen)
+	}
+	out := s.wrOut[:4]
+	binary.BigEndian.PutUint32(out[0:4], uint32(pktLen))
+
+	if s.wrNonce == nil {
+		s.wrNonce = make([]byte, s.encrypter.NonceSize())
+	}
+	binary.BigEndian.PutUint64(s.wrNonce[len(s.wrNonce)-8:], s.writeSeq)
+	s.writeSeq++
+
+	// Seal appends ciphertext+tag right after the 4-byte header; AAD = header.
+	// dst (out[4:]) and plaintext (p) don't overlap -> valid.
+	out = s.encrypter.Seal(out, s.wrNonce, p, out[0:4])
+	s.wrOut = out // preserve grown backing array
+
+	conn := s.getConn()
+	if conn == nil {
+		return errors.New("session has no active connection")
+	}
+	_, err := conn.Write(out)
+	return err
+}
+
+// IsClientChannelID reports whether id belongs to the client-initiated
+// namespace (top bit set).
+func IsClientChannelID(id uint32) bool {
+	return id&ClientChannelIDBit != 0
+}
+
+// for server-initiated channel ID.
+//
+//	The top bit is masked off so these IDs always live in the low half of the space and can
+//
+// never collide with client-initiated IDs (defensive against counter wrap).
 func (s *Session) IncrementChannelID() uint32 {
-	return s.channelCounter.Add(1)
+	return s.channelCounter.Add(1) &^ ClientChannelIDBit
+}
+
+// IncrementClientChannelID allocates a client-initiated channel ID (top bit
+// set). Only the peer that opens a channel -- the client, for `-L` local
+// forwards -- calls this.
+func (s *Session) IncrementClientChannelID() uint32 {
+	return s.channelCounter.Add(1) | ClientChannelIDBit
 }
 
 func (s *Session) AddActiveChannel(id uint32, conn io.ReadWriteCloser) {
@@ -340,11 +436,78 @@ func (s *Session) AddActiveChannel(id uint32, conn io.ReadWriteCloser) {
 	s.activeChannels[id] = conn
 }
 
+func (s *Session) AddActiveChannelIfAbsent(id uint32, conn io.ReadWriteCloser) bool {
+	s.activeChannelsMu.Lock()
+	defer s.activeChannelsMu.Unlock()
+	if s.activeChannels == nil {
+		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+	}
+	if _, exists := s.activeChannels[id]; exists {
+		return false
+	}
+	s.activeChannels[id] = conn
+	return true
+}
+
 func (s *Session) GetActiveChannel(id uint32) (io.ReadWriteCloser, bool) {
 	s.activeChannelsMu.RLock()
 	defer s.activeChannelsMu.RUnlock()
 	conn, exists := s.activeChannels[id]
 	return conn, exists
+}
+
+func (s *Session) WaitForClientChannelOpenConfirmed(id uint32) bool {
+
+	pkt, err := s.ReadPacket()
+	if err != nil {
+		log.Printf("[Error] Failed to read packet while waiting for channel confirmation: %v", err)
+		return false
+	}
+
+	if pkt.Payload[0] != MsgClientChannelOpenConfirm {
+		log.Printf("[Error] Expected MsgClientChannelOpenConfirm but got: %d", pkt.Payload[0])
+		return false
+	}
+	confirm, err := ParseClientChannelOpenConfirm(pkt.Payload[1:])
+
+	if err != nil {
+		log.Printf("Malformed Channel Open Confirmation from client")
+		return false
+	}
+
+	if confirm.ChannelID != id {
+		log.Printf("[Error] Channel ID mismatch: expected %d, got %d", id, confirm.ChannelID)
+		return false
+	}
+
+	s.ConfirmChannelsMu.Lock()
+	defer s.ConfirmChannelsMu.Unlock()
+	if confirm.Success {
+		if s.channelOpenConfirmed == nil {
+			s.channelOpenConfirmed = make(map[uint32]bool)
+		}
+
+		s.channelOpenConfirmed[id] = true
+		return true
+	}
+
+	return false
+}
+
+func (s *Session) AddActiveChannelWithConfirmation(id uint32, conn io.ReadWriteCloser) {
+	s.activeChannelsMu.Lock()
+	if s.activeChannels == nil {
+		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+	}
+	s.activeChannels[id] = conn
+	s.activeChannelsMu.Unlock()
+
+	s.ConfirmChannelsMu.Lock()
+	if s.channelOpenConfirmed == nil {
+		s.channelOpenConfirmed = make(map[uint32]bool)
+	}
+	s.channelOpenConfirmed[id] = false
+	s.ConfirmChannelsMu.Unlock()
 }
 
 func (s *Session) DeleteActiveChannel(id uint32) {

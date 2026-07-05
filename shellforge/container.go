@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,11 +13,13 @@ import (
 	"time"
 )
 
+var ErrMalformedContainerOpRequest = errors.New("malformed ContainerOpRequest packet: out of bounds")
+
 const IMAGE_NAME_PREFIX string = "shf_image_"
 const CONTAINER_NAME_PREFIX string = "shf_container_"
 
-type ContainerShellRequset struct {
-	// client sends EnvRequest with  message type MsgClientGetContainer
+type ContainerGetRequset struct {
+	// client sends EnvRequest with  message type MsgClientGetContainerShell
 }
 
 type ContainersListResponse struct {
@@ -24,6 +27,36 @@ type ContainersListResponse struct {
 	RequestID      uint32
 	PublicKey      []byte // 32 bytes (Ed25519)
 	ContainersList []string
+}
+
+const (
+	// Container operation types
+	ContainerOpShell   uint8 = 1
+	ContainerOpLogs    uint8 = 2
+	ContainerOpCommand uint8 = 3
+	ContainerOpTop     uint8 = 4
+	ContainerOpStats   uint8 = 5
+	ContainerOpInspect uint8 = 6
+	ContainerOpStop    uint8 = 7
+	ContainerOpKill    uint8 = 8
+	ContainerOpRestart uint8 = 9
+)
+
+// container operation request sent by client to daemon to get a shell/log/stats etc in the container
+type ContainerOpRequest struct {
+	RequestID uint32
+	PublicKey []byte // 32 bytes (Ed25519)
+	NameLen   uint8
+	Name      []byte // Container name alias
+
+	OpType uint8 // 1=shell, 2=logs, 3=command(exec) , 4=top , 5=stats, 6=inspect, 7=stop, 8=kill, 9=restart
+
+	CommandLen uint16 // Only used if OpType == 3
+	Command    []byte // The command to execute
+
+	// For shell access (OpType == 1 or OpType == 3 if interactive)
+	Row  uint16
+	Cols uint16
 }
 
 // Daemon replies, confirming the RequestID and providing the official ChannelID
@@ -274,4 +307,130 @@ func waitForContainerState(ctx context.Context, containerName string, target str
 	}
 	return fmt.Errorf("container %s did not reach state %q within %s (current: %s)",
 		containerName, target, timeout, getContainerState(containerName))
+}
+
+// Type satisfies your Packet interface
+func (cr *ContainerOpRequest) Type() uint8 {
+	return MsgClientContainerOpRequest // e.g., define this as 27 in protocol.go
+}
+
+// Unmarshal parses the binary payload and populates the receiver struct in-place
+func (cr *ContainerOpRequest) Unmarshal(data []byte) error {
+	parsed, err := ParseContainerOpRequest(data)
+	if err != nil {
+		return err
+	}
+	*cr = *parsed
+	return nil
+}
+
+// ParseContainerOpRequest extracts the payload securely with strict bounds checking
+func ParseContainerOpRequest(data []byte) (*ContainerOpRequest, error) {
+	cr := &ContainerOpRequest{}
+	offset := 0
+
+	// 1. Base Bounds check: RequestID(4) + PublicKey(32) + NameLen(1) = 37 bytes minimum
+	if len(data) < offset+37 {
+		return nil, ErrMalformedContainerOpRequest
+	}
+
+	cr.RequestID = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	cr.PublicKey = data[offset : offset+32]
+	offset += 32
+
+	cr.NameLen = data[offset]
+	offset += 1
+
+	// 2. Read Name
+	if len(data) < offset+int(cr.NameLen) {
+		return nil, ErrMalformedContainerOpRequest
+	}
+	cr.Name = data[offset : offset+int(cr.NameLen)] // Zero-Copy conversion
+	offset += int(cr.NameLen)
+
+	// 3. Read OpType (1 byte)
+	if len(data) < offset+1 {
+		return nil, ErrMalformedContainerOpRequest
+	}
+	cr.OpType = data[offset]
+	offset += 1
+
+	// 4. Handle Command Payload (Only if OpType is 3 - Command Exec)
+	if cr.OpType == 3 {
+		if len(data) < offset+2 {
+			return nil, ErrMalformedContainerOpRequest
+		}
+		cr.CommandLen = binary.BigEndian.Uint16(data[offset : offset+2])
+		offset += 2
+
+		if len(data) < offset+int(cr.CommandLen) {
+			return nil, ErrMalformedContainerOpRequest
+		}
+		cr.Command = data[offset : offset+int(cr.CommandLen)]
+		offset += int(cr.CommandLen)
+	}
+
+	// 5. Bounds check: Row (2) + Cols (2) = 4 bytes
+	if len(data) < offset+4 {
+		return nil, ErrMalformedContainerOpRequest
+	}
+	cr.Row = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	cr.Cols = binary.BigEndian.Uint16(data[offset : offset+2])
+
+	return cr, nil
+}
+
+// Marshal converts the ContainerOpRequest struct into a binary network payload
+func (cr *ContainerOpRequest) Marshal() []byte {
+	// Base size: RequestID(4) + PublicKey(32) + NameLen(1) + Name + OpType(1) + Row(2) + Cols(2)
+	totalSize := 4 + 32 + 1 + len(cr.Name) + 1 + 2 + 2
+
+	// Include command bytes if OpType == 3
+	if cr.OpType == 3 {
+		totalSize += 2 + len(cr.Command)
+	}
+
+	out := make([]byte, totalSize)
+	offset := 0
+
+	// Write RequestID (4 bytes)
+	binary.BigEndian.PutUint32(out[offset:], cr.RequestID)
+	offset += 4
+
+	// Write PublicKey (Exactly 32 bytes)
+	if len(cr.PublicKey) != 32 {
+		panic("wireforge: ContainerOpRequest PublicKey must be exactly 32 bytes")
+	}
+	offset += copy(out[offset:], cr.PublicKey)
+
+	// Write NameLen (1 byte)
+	out[offset] = uint8(len(cr.Name))
+	offset += 1
+
+	// Write Name
+	offset += copy(out[offset:], cr.Name)
+
+	// Write OpType (1 byte)
+	out[offset] = cr.OpType
+	offset += 1
+
+	// Write CommandLen and Command (only if OpType == 3)
+	if cr.OpType == 3 {
+		binary.BigEndian.PutUint16(out[offset:], uint16(len(cr.Command)))
+		offset += 2
+		offset += copy(out[offset:], cr.Command)
+	}
+
+	// Write Row (2 bytes)
+	binary.BigEndian.PutUint16(out[offset:], cr.Row)
+	offset += 2
+
+	// Write Cols (2 bytes)
+	binary.BigEndian.PutUint16(out[offset:], cr.Cols)
+
+	return out
 }

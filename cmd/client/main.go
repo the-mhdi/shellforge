@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -59,7 +60,7 @@ func main() {
 	case "container":
 		err = runContainerMode(ctx, args[1:], configOverride)
 	case "containers":
-		err = runContainersMode(ctx, args[1:], configOverride)
+		err = getContainers(ctx, args[1:], configOverride)
 	case "make":
 		err = runMakeMode(ctx, args[1:], configOverride)
 	default:
@@ -84,43 +85,176 @@ func main() {
 	}
 }
 
-// ---------------------------------------------------------------------
-// Mode: ./client container containerName@ip:port [-c configdir]
-// ---------------------------------------------------------------------
+// runContainerMode now dispatches subcommands:
+//
+//	./client container <name@ip:port>                         → interactive shell
+//	./client container logs <name@ip:port>                    → stream logs
+//	./client container inspect <name@ip:port>                 → inspect JSON
+//	./client container stats <name@ip:port>                   → resource stats
+//	./client container top <name@ip:port>                     → process list
+//	./client container command "<cmd>" <name@ip:port>         → exec one-shot command
 func runContainerMode(ctx context.Context, args []string, configOverride string) error {
-	if len(args) != 1 {
-		return errors.New("usage: client container <containerName>@<ip:port> [-c configdir]")
+	if len(args) < 1 {
+		return errors.New("usage: client container [logs|inspect|stats|top|command] <name>@<ip:port> [-c configdir]")
 	}
-	name, hostport, err := parseNameAtHostPort(args[0])
+
+	// Detect subcommand vs direct "name@host" invocation.
+	subcommands := map[string]bool{
+		"logs": true, "inspect": true, "stats": true, "top": true, "command": true,
+	}
+
+	if !subcommands[args[0]] {
+		// Original path: ./client container <name@ip:port>
+		if len(args) != 1 {
+			return errors.New("usage: client container <name>@<ip:port> [-c configdir]")
+		}
+		return runContainerShell(ctx, args[0], configOverride)
+	}
+
+	sub := args[0]
+	rest := args[1:]
+
+	switch sub {
+	case "logs":
+		if len(rest) != 1 {
+			return errors.New("usage: client container logs <name>@<ip:port>")
+		}
+		return runContainerLogs(ctx, rest[0], configOverride)
+
+	/*case "inspect":
+		if len(rest) != 1 {
+			return errors.New("usage: client container inspect <name>@<ip:port>")
+		}
+		return runContainerInspect(ctx, rest[0], configOverride)
+
+	case "stats":
+		if len(rest) != 1 {
+			return errors.New("usage: client container stats <name>@<ip:port>")
+		}
+		return runContainerStats(ctx, rest[0], configOverride)
+
+	case "top":
+		if len(rest) != 1 {
+			return errors.New("usage: client container top <name>@<ip:port>")
+		}
+		return runContainerTop(ctx, rest[0], configOverride)
+	*/
+	case "command":
+		// ./client container command "ps aux" name@ip:port
+		if len(rest) != 2 {
+			return errors.New("usage: client container command \"<command>\" <name>@<ip:port>")
+		}
+		return runContainerCommand(ctx, rest[0], rest[1], configOverride)
+
+	default:
+		return fmt.Errorf("unknown container subcommand %q", sub)
+	}
+}
+
+// runContainerShell is the original interactive-shell path, extracted for clarity.
+func runContainerShell(ctx context.Context, nameAtHost, configOverride string) error {
+	name, hostport, err := parseNameAtHostPort(nameAtHost)
 	if err != nil {
 		return err
 	}
+	client, signer, err := connectClient(ctx, hostport, configOverride)
+	if err != nil {
+		return err
+	}
+	log.Printf("[CLI] Launching interactive shell in container: %s", name)
+	return client.GetAndRunContainer(name, signer)
+}
 
+func runContainerLogs(ctx context.Context, nameAtHost, configOverride string) error {
+	name, hostport, err := parseNameAtHostPort(nameAtHost)
+	if err != nil {
+		return err
+	}
+	client, signer, err := connectClient(ctx, hostport, configOverride)
+	if err != nil {
+		return err
+	}
+	log.Printf("[CLI] Fetching logs for container: %s", name)
+	return client.GetContainerLogs(ctx, name, signer)
+}
+
+/*
+	func runContainerInspect(ctx context.Context, nameAtHost, configOverride string) error {
+		name, hostport, err := parseNameAtHostPort(nameAtHost)
+		if err != nil {
+			return err
+		}
+		client, signer, err := connectClient(ctx, hostport, configOverride)
+		if err != nil {
+			return err
+		}
+		log.Printf("[CLI] Inspecting container: %s", name)
+		return client.GetContainerInspect(ctx, name, signer)
+	}
+
+	func runContainerStats(ctx context.Context, nameAtHost, configOverride string) error {
+		name, hostport, err := parseNameAtHostPort(nameAtHost)
+		if err != nil {
+			return err
+		}
+		client, signer, err := connectClient(ctx, hostport, configOverride)
+		if err != nil {
+			return err
+		}
+		log.Printf("[CLI] Fetching stats for container: %s", name)
+		return client.GetContainerStats(ctx, name, signer)
+	}
+
+	func runContainerTop(ctx context.Context, nameAtHost, configOverride string) error {
+		name, hostport, err := parseNameAtHostPort(nameAtHost)
+		if err != nil {
+			return err
+		}
+		client, signer, err := connectClient(ctx, hostport, configOverride)
+		if err != nil {
+			return err
+		}
+		log.Printf("[CLI] Fetching process list for container: %s", name)
+		return client.GetContainerTop(ctx, name, signer)
+	}
+*/
+func runContainerCommand(ctx context.Context, command, nameAtHost, configOverride string) error {
+	name, hostport, err := parseNameAtHostPort(nameAtHost)
+	if err != nil {
+		return err
+	}
+	client, signer, err := connectClient(ctx, hostport, configOverride)
+	if err != nil {
+		return err
+	}
+	log.Printf("[CLI] Executing command in container %s: %q", name, command)
+	return client.ContainerExec(ctx, name, command, signer)
+}
+
+// connectClient is a shared helper that builds the client, connects, and
+// loads the signer — avoids repeating these three steps in every mode func.
+func connectClient(ctx context.Context, hostport, configOverride string) (*shellforge.Client, crypto.Signer, error) {
 	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
-		return err
+		return nil, nil, err
 	}
 	configDir := resolveConfigDir(configOverride)
+
 	signers, err := shellforge.LoadKeys(configDir, true)
 
 	if err != nil {
-		return err
-
+		return nil, nil, err
 	}
-	primary := signers[0]
-
-	log.Printf("[CLI] Querying and running container: %s", name)
-	return client.GetAndRunContainer(name, primary)
+	return client, signers[0], nil
 }
 
 // ---------------------------------------------------------------------
 // Mode: ./client containers ip:port [-c configdir]
 // ---------------------------------------------------------------------
-func runContainersMode(ctx context.Context, args []string, configOverride string) error {
+func getContainers(ctx context.Context, args []string, configOverride string) error {
 	if len(args) != 1 {
 		return errors.New("usage: client containers <ip:port> [-c configdir]")
 	}

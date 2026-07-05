@@ -60,6 +60,10 @@ type ClientConfig struct {
 	ClientCert  []byte          // DER-encoded client certificate
 	PrivateKeys []crypto.Signer // e.g. *ecdsa.PrivateKey or ed25519.PrivateKey
 
+	KnownHostsPath string //defaults to <ClientDir>/known_hosts
+
+	InsecureSkipHostKeyVerify bool // for testing only!!!!
+
 }
 
 // Client represents a connection to a Wireforge daemon.
@@ -341,6 +345,10 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 
 		if !sHello.EncryptionSupport {
 			return errors.New("server rejected encryption support")
+		}
+
+		if err := c.verifyServerIdentity(sHello, clientRandom, KEX, Cipher); err != nil {
+			return fmt.Errorf("[Error] server identity verification failed: %w", err)
 		}
 
 		// Split the server's share key depending on the chosen KEX
@@ -626,6 +634,10 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 		if !sHello.EncryptionSupport {
 			return errors.New("server rejected encryption support")
+		}
+
+		if err := c.verifyServerIdentity(sHello, clientRandom, KEX, Cipher); err != nil {
+			return fmt.Errorf("[Error] server identity verification failed: %w", err)
 		}
 
 		// Split the server's share key depending on the chosen KEX
@@ -934,7 +946,7 @@ func (c *Client) eventLoop() {
 					return
 				}
 			}
-		case MsgServerOpenLogChannel:
+		case MsgServerOpenLogChannel, MsgServerOpenReadChannel:
 			ch, err := ParseChannelOpen(pkt.Payload[1:])
 			if err != nil {
 				log.Printf("[Error] failed to open log channel: %v", err)
@@ -943,7 +955,11 @@ func (c *Client) eventLoop() {
 
 			c.session.AddActiveChannel(ch.ChannelID, os.Stdout)
 			log.Printf("Server Log channel Opened, %d", ch.ChannelID)
-
+			confirm := &ClientChannelOpenConfirm{
+				ChannelID: ch.ChannelID,
+				Success:   true,
+			}
+			c.session.WritePacket(MsgClientChannelOpenConfirm, confirm.Marshal())
 			defer c.session.DeleteActiveChannel(ch.ChannelID)
 
 		case MsgServerNewChannelOpened:
@@ -1071,6 +1087,44 @@ func (c *Client) eventLoop() {
 	}
 
 }
+func (c *Client) verifyServerIdentity(sHello *ServerHello, clientRandom []byte, kexAlgo, cipher uint16) error {
+	if c.conf != nil && c.conf.InsecureSkipHostKeyVerify {
+		log.Printf("[Security][WARNING] Host key verification DISABLED ... vulnerable to active MITM!")
+		return nil
+	}
+
+	hostPub, err := VerifyServerHelloSignature(sHello, clientRandom, kexAlgo, cipher)
+	if err != nil {
+		return err
+	}
+	knownHostsPath := c.knownHostsPath() // config override
+	pinned, err := CheckOrPinHostKey(knownHostsPath, c.DaemonAddr, hostPub)
+	if err != nil {
+		return fmt.Errorf("host key check for %s: %w", c.DaemonAddr, err)
+	}
+
+	if pinned {
+		log.Printf("[Security] Pinned NEW host key for %s: %x (trust-on-first-use) -- verify this fingerprint out-of-band!", c.DaemonAddr, []byte(hostPub))
+	} else {
+		log.Printf("[Security] Server host key for %s verified against known_hosts.", c.DaemonAddr)
+	}
+	return nil
+}
+
+// knownHostsPath resolves the known_hosts location: explicit config override
+// first, then <ClientDir>/known_hosts, then the package default
+// (~/.shellforge/known_hosts).
+func (c *Client) knownHostsPath() string {
+	if c.conf != nil {
+		if c.conf.KnownHostsPath != "" {
+			return c.conf.KnownHostsPath
+		}
+		if c.conf.ClientDir != "" {
+			return filepath.Join(c.conf.ClientDir, "known_hosts")
+		}
+	}
+	return DefaultKnownHostsPath()
+}
 
 // handleIncomingTunnel is called when the daemon tells us a web user connected.
 func (c *Client) handleIncomingTrafiic(channelID uint32, localTarget string) {
@@ -1090,7 +1144,7 @@ func (c *Client) handleIncomingTrafiic(channelID uint32, localTarget string) {
 	for {
 		n, err := localConn.Read(buf)
 		if n > 0 {
-			cd := &ChannelData{
+			cd := &Channel{
 				ChannelID: channelID,
 				Data:      buf[:n],
 			}
@@ -1121,7 +1175,7 @@ func (c *Client) ForwardRemoteToLocal(remotePort string, localTarget string) err
 func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr string, remoteTarget string) error {
 
 	handler := func(ctx context.Context, localConn net.Conn) {
-		chanID := c.session.IncrementChannelID()
+		chanID := c.session.IncrementClientChannelID()
 		c.session.AddActiveChannel(chanID, localConn)
 		defer c.session.DeleteActiveChannel(chanID)
 		defer localConn.Close()
@@ -1144,7 +1198,7 @@ func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr strin
 		for {
 			n, err := localConn.Read(buf)
 			if n > 0 {
-				cd := &ChannelData{
+				cd := &Channel{
 					ChannelID: chanID,
 					Data:      buf[:n],
 				}
@@ -1356,12 +1410,12 @@ func (c *Client) CreateENV(envType, RequestedName string, prvKey crypto.Signer) 
 
 // GetAndRunContainer checks if a container exists, boots it, or cleanly prints
 // a list of alternative valid active containers if it is missing [1, 3].
-func (c *Client) GetAndRunContainer(containerName string, prvKey crypto.Signer) error {
+func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) error {
 	reqID := binary.BigEndian.Uint32(randomBytes(4))
 	stdinFd := int(os.Stdin.Fd())
 
 	// FIXED: Corrected type assertion [1]
-	if edKey, ok := prvKey.(ed25519.PrivateKey); ok {
+	if edKey, ok := signer.(ed25519.PrivateKey); ok {
 		log.Println("[Log] Executing Cryptographic Public Key Authentication...")
 		publicKey := edKey.Public().(ed25519.PublicKey)
 
@@ -1377,7 +1431,22 @@ func (c *Client) GetAndRunContainer(containerName string, prvKey crypto.Signer) 
 			UserRequestedName:    []byte(containerName),
 		}
 
-		if err := c.session.WritePacket(MsgClientGetContainer, req.Marshal()); err != nil {
+		if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+			return err
+		}
+		cols, rows, _ := term.GetSize(stdinFd)
+
+		shellreq := &ContainerOpRequest{
+			OpType:    1,
+			RequestID: reqID,
+			PublicKey: publicKey,
+			NameLen:   uint8(len(containerName)),
+			Name:      []byte(containerName),
+			Row:       uint16(rows),
+			Cols:      uint16(cols),
+		}
+
+		if err := c.session.WritePacket(MsgClientGetContainerShell, shellreq.Marshal()); err != nil {
 			return err
 		}
 
@@ -1481,6 +1550,83 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 	return nil
 }
 
+// code MsgClientContainerLog
+func (c *Client) GetContainerLogs(ctx context.Context, name string, signer crypto.Signer) error {
+
+	reqID := binary.BigEndian.Uint32(randomBytes(4))
+
+	// FIXED: Corrected type assertion [1]
+	if _, ok := signer.(ed25519.PrivateKey); ok {
+		log.Println("[Log] Executing Cryptographic Public Key Authentication...")
+
+	}
+	// Sign the unique Session ID
+	signature := ed25519.Sign(signer.(ed25519.PrivateKey), c.session.ID)
+	req := &EnvRequest{
+		RequestID:            reqID,
+		PublicKey:            signer.Public().(ed25519.PublicKey),
+		Signature:            signature,
+		AccessTypeLen:        uint16(len("container")),
+		AccessType:           []byte("container"),
+		UserRequestedNameLen: uint8(len(name)),
+		UserRequestedName:    []byte(name),
+	}
+
+	if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+		return err
+	}
+
+	conR := &ContainerOpRequest{
+		OpType:    2,
+		RequestID: reqID,
+		PublicKey: signer.Public().(ed25519.PublicKey),
+		NameLen:   uint8(len(name)),
+		Name:      []byte(name),
+	}
+
+	return c.session.WritePacket(MsgClientContainerLog, conR.Marshal())
+}
+
+// //func (c *Client) GetContainerInspect(ctx context.Context, name string, signer crypto.Signer) error{}
+// func (c *Client) GetContainerStats(ctx context.Context, name string, signer crypto.Signer) error{}
+// func (c *Client) GetContainerTop(ctx context.Context, name string, signer crypto.Signer) error{}
+
+// msg code : MsgClientContainerCommandExec
+func (c *Client) ContainerExec(ctx context.Context, name, command string, signer crypto.Signer) error {
+	reqID := binary.BigEndian.Uint32(randomBytes(4))
+
+	if _, ok := signer.(ed25519.PrivateKey); !ok {
+		log.Println("[Log] Executing Cryptographic Public Key Authentication...")
+		return errors.New("unsupported private key type (must be ed25519)")
+	}
+
+	signature := ed25519.Sign(signer.(ed25519.PrivateKey), c.session.ID)
+	req := &EnvRequest{
+		RequestID:            reqID,
+		PublicKey:            signer.Public().(ed25519.PublicKey),
+		Signature:            signature,
+		AccessTypeLen:        uint16(len("container")),
+		AccessType:           []byte("container"),
+		UserRequestedNameLen: uint8(len(name)),
+		UserRequestedName:    []byte(name),
+	}
+
+	if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+		return err
+	}
+	conR := &ContainerOpRequest{
+		OpType:     3,
+		RequestID:  reqID,
+		PublicKey:  signer.Public().(ed25519.PublicKey),
+		NameLen:    uint8(len(name)),
+		Name:       []byte(name),
+		CommandLen: uint16(len(command)),
+		Command:    []byte(command),
+	}
+
+	return c.session.WritePacket(MsgClientContainerCommandExec, conR.Marshal())
+}
+
 // loadKeys scans configDir for all usable private key files (any filename,
 // skipping *.pub and config.json), parses each one, and returns them
 // sorted by filename (so the result is deterministic and the "primary"
@@ -1492,6 +1638,7 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 func LoadKeys(keyDir string, fallback bool) ([]crypto.Signer, error) {
 	return loadKeys(keyDir, fallback)
 }
+
 func loadKeys(keyDir string, fallback bool) ([]crypto.Signer, error) {
 	signers, err := loadKeysFromDir(keyDir)
 	if err != nil {

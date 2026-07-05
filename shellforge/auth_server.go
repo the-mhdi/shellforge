@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 
 	"github.com/msteinert/pam"
@@ -41,22 +42,20 @@ func VerifyClientSignature(filepath string, sessionID, signature, presentedPubKe
 
 		pubKeyBytes, err := hex.DecodeString(parts[1])
 		if err != nil {
-			return false, fmt.Errorf("invalid hex in authorized_keys: %v", err)
+			log.Printf("[auth] skipping malformed authorized_keys line: invalid hex: %v", err)
+			continue
 		}
 		if len(pubKeyBytes) != 32 {
-			return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
+			log.Printf("[auth] skipping authorized_keys line with invalid key size: %d", len(pubKeyBytes))
+			continue
 		}
-		// Prevent man-in-the-middle key spoofing
 		if !bytes.Equal(presentedPubKey, pubKeyBytes) {
-			return false, fmt.Errorf("presented public key is not authorized")
+			continue // check the NEXT authorized key
 		}
 
-		if len(pubKeyBytes) != 32 {
-			return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
-		}
-		isValid := ed25519.Verify(presentedPubKey, sessionID, signature)
-		if !isValid {
-			return false, fmt.Errorf("couldnt verify the sig!")
+		/**********************/
+		if !ed25519.Verify(presentedPubKey, sessionID, signature) {
+			return false, fmt.Errorf("[auth] signature verification failed for authorized key")
 		}
 		return true, nil
 
@@ -162,4 +161,23 @@ func SysUserExists(username string) bool {
 	}
 
 	return true
+}
+
+func AuthorizedKeysPathForUser(username string) (string, error) {
+	if username == "" ||
+		strings.ContainsAny(username, `/\`) ||
+		strings.Contains(username, "..") ||
+		username != filepath.Base(username) {
+		return "", fmt.Errorf("[auth] invalid username %q: path separators or traversal not allowed", username)
+	}
+
+	u, err := user.Lookup(username)
+	if err != nil {
+		return "", fmt.Errorf("[auth] user lookup failed for %q: %w", username, err)
+	}
+	if u.HomeDir == "" || !filepath.IsAbs(u.HomeDir) {
+		return "", fmt.Errorf("[auth] user %q has no absolute home directory (got %q)", username, u.HomeDir)
+	}
+
+	return filepath.Join(u.HomeDir, ".shellforge", "authorized_keys"), nil
 }

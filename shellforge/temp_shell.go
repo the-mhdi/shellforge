@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+const (
+	TEMPSHELL_SESSION_HEADER_KEY string = "tempSession" //included in client hello headers
+	TEMPSHELL_USER_PREFIX        string = "wf_tmp_"
+)
+
 // has two phases: 1 . create 2. connect, first one doesnt need regular shell authentication, second needs it's own authenticaion
 
 // a temp shell/user:
@@ -79,7 +84,7 @@ func DeleteSystemUser(username string) error {
 	// Ephemeral sandbox users created by Wireforge always start with the prefix "wf_tmp_".
 	// We strictly reject deleting any user without this prefix to protect real system accounts
 	// (like "root", "admin", "bin", or "daemon") from accidental deletion!
-	if !strings.HasPrefix(username, "TEMPSHELL_USER_PREFIX") {
+	if !strings.HasPrefix(username, TEMPSHELL_USER_PREFIX) {
 		return fmt.Errorf("security block: refuse to delete non-ephemeral system user %q", username)
 	}
 

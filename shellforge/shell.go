@@ -23,6 +23,14 @@ type Shell struct {
 	Pipe io.ReadWriteCloser
 }
 
+func newShell(PTY *os.File, Pipe io.ReadWriteCloser) *Shell {
+	return &Shell{
+		ID:   make([]byte, 8),
+		PTY:  PTY,
+		Pipe: Pipe,
+	}
+}
+
 // Client requests a shell and provides a temporary RequestID
 type ShellRequest struct {
 	RequestID   uint32 // Used by the client to track pending requests
