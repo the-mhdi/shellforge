@@ -144,6 +144,12 @@ func (d *Daemon) listen() {
 		defer cancel() // Automatically fires when this handler exits!
 
 		session := NewSession(fd)
+		newSessionID := generateSessionID(32)
+		log.Printf("session id generated, %x", newSessionID)
+		session.ID = newSessionID
+		d.State.SaveSession(newSessionID, session)
+		defer d.State.DeleteSession(session.ID)
+
 		session.isDaemon = true
 
 		defer session.Close()
@@ -151,35 +157,34 @@ func (d *Daemon) listen() {
 		// ==========================================
 		// PHASE 1: THE INIT EXCHANGE (Cleartext)
 		// ==========================================
-		initPkt, err := session.ReadPacket()
-		if err != nil {
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 
+		initPkt, err := session.ReadPacket()
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
+		if err != nil {
 			return
 		}
 
 		if initPkt.Payload[0] != MsgClientInit {
 			log.Println("Expected ClientInit, dropping connection.")
 			session.WritePacket(MsgServerClientInitInvalid, nil)
-
 			return
 		}
 
 		log.Printf("[CLI] Received Client Init Message: %s", string(initPkt.Payload[1:]))
-
 		// Let the user dictate if this client is allowed based on their Init string
-		if d.Conf.ClientInitHandler == nil {
-			d.Conf.ClientInitHandler = d.DefaultClientInitHandler(connCtx, initPkt.Payload[1:])
-		}
+		//if d.Conf.ClientInitHandler == nil {
+		//	d.Conf.ClientInitHandler = d.DefaultClientInitHandler(connCtx, initPkt.Payload[1:])
+		//}
 
 		if d.Conf.ClientInitHandler != nil && !d.Conf.ClientInitHandler(connCtx, initPkt.Payload[1:]) {
 			log.Println("ClientInit rejected by handler.")
 			session.WritePacket(MsgServerClientInitRejected, nil)
-
 			return
 		}
 
 		// Success! Send ServerInit back to the client
-		err = session.WritePacket(MsgServerInit, []byte(d.Conf.DaemonInitMsg))
+		err = session.WritePacketRaw(MsgServerInit, []byte(d.Conf.DaemonInitMsg))
 		if err != nil {
 
 			return
@@ -189,10 +194,12 @@ func (d *Daemon) listen() {
 		// PHASE 2: CLIENT HELLO (unEncrypted)
 		// ==========================================
 		cHelloPkt, err := session.ReadPacket()
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Println(err)
 			return
 		}
+
 		if cHelloPkt.Payload[0] != MsgClientHello {
 			session.WritePacket(MsgServerExpectedClientHello, nil)
 			return
@@ -209,12 +216,11 @@ func (d *Daemon) listen() {
 		enc, dec, serverHello, err := d.HandShake(session, cHello)
 		if err != nil {
 			log.Printf("handshake failed: %v", err)
-			session.WritePacket(MsgServerEncryptionHandShakeFailed, serverHello.Marshal())
+			session.WritePacket(MsgServerEncryptionHandShakeFailed, nil)
 			return
 		}
 
-		defer d.State.DeleteSession(session.ID)
-		err = session.WritePacket(MsgServerHello, serverHello.Marshal())
+		err = session.WritePacket(MsgServerHello, serverHello)
 		if err != nil {
 			log.Printf("failed to send ServerHello: %v", err)
 			return
@@ -241,11 +247,12 @@ func (d *Daemon) listen() {
 		// PHASE 3.5: authenticate access//shell
 		// ==========================================
 		pkt, err := session.ReadPacket()
-
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Printf("%v", err)
 			return
 		}
+
 		switch pkt.Payload[0] {
 
 		case MsgClientENVCreate:
@@ -257,15 +264,15 @@ func (d *Daemon) listen() {
 			}
 
 			chanID := session.IncrementChannelID()
-			pipeStream := NewPipe(chanID, session)
-			session.AddActiveChannel(chanID, pipeStream)
+			pipe := NewPipe(chanID, session)
+			pipeStream := session.AttachChannel(chanID, pipe, false)
 
 			log.Printf("LogStream created and added to active channel %d", chanID)
 			co := &ChannelOpen{
 				ChannelID: chanID,
 			}
 
-			session.WritePacket(MsgServerOpenLogChannel, co.Marshal())
+			session.WritePacket(MsgServerOpenLogChannel, co)
 
 			env, err := d.CreateEnvironment(connCtx, pipeStream, string(session.ID), eReq)
 
@@ -285,7 +292,7 @@ func (d *Daemon) listen() {
 				Name:                 []byte(env.Name),
 				Success:              true,
 			}
-			session.WritePacket(MsgServerENVCreated, envr.Marshal())
+			session.WritePacket(MsgServerENVCreated, envr)
 			return
 
 		case MsgClientAuthPub, MsgClientAuthPassword, MsgClientAuthPKI:
@@ -313,7 +320,7 @@ func (d *Daemon) listen() {
 				if AuthRes.Success == false {
 					if i < MAX_AUTH_RETRY {
 						log.Printf("auth failed attempt %d", i)
-						session.WritePacket(MsgServerAuthResponse, AuthRes.Marshal())
+						session.WritePacket(MsgServerAuthResponse, AuthRes)
 						continue
 					}
 					if i >= MAX_AUTH_RETRY {
@@ -344,7 +351,7 @@ func (d *Daemon) listen() {
 			}
 			// Success!
 			log.Printf("User Authenticated Sending Auth response for username: %s", session.User)
-			session.WritePacket(MsgServerAuthResponse, ar.Marshal())
+			session.WritePacket(MsgServerAuthResponse, ar)
 			log.Printf("User [%s] authenticated successfully!", session.User)
 			// PHASE 4: THE SECURE EVENT LOOP (Multiplexing)
 
@@ -398,7 +405,7 @@ func (d *Daemon) listen() {
 				}
 
 				//send ContainersListResponse if no name specified
-				err = session.WritePacket(MsgServerContainersListResponse, clist.Marshal())
+				err = session.WritePacket(MsgServerContainersListResponse, clist)
 				if err != nil {
 					log.Println(err)
 					return
@@ -411,7 +418,7 @@ func (d *Daemon) listen() {
 					log.Printf("max container connections reached, no other client conns allowed")
 					return
 				}
-				log.Printf("container loop running")
+
 				session.PublicKey = eReq.PublicKey
 				d.ContainerLoop(connCtx, session)
 			}
@@ -461,25 +468,25 @@ func (d *Daemon) HandShake(session *Session, cHello *ClientHello) (encrypter, de
 	}
 
 	// Generate 32-byte Session ID
-	newSessionID := generateSessionID(32)
-	log.Printf("session id generated, %x", newSessionID)
+	//newSessionID := generateSessionID(32)
+	//log.Printf("session id generated, %x", newSessionID)
 
 	//encrypt the session
-	enc, dec, serverShareKey, err := encryptSession(cHello, session, newSessionID)
+	enc, dec, serverShareKey, err := encryptSession(cHello, session, session.ID)
 	if err != nil {
 		log.Printf("Faild to encrypt the session, %v", err)
 		return nil, nil, nil, err
 	}
 
 	// 7. Save session state
-	session.ID = newSessionID
-	d.State.SaveSession(newSessionID, session)
+	//session.ID = newSessionID
+	//d.State.SaveSession(newSessionID, session)
 	//defer d.State.DeleteSession(session.ID)
 
 	sh := &ServerHello{
 		SessionResumed:    false,
-		SessLen:           uint16(len(newSessionID)),
-		SessionID:         newSessionID,
+		SessLen:           uint16(len(session.ID)),
+		SessionID:         session.ID,
 		EncryptionSupport: true,
 		Encryption: ServerHelloEncryptionFields{
 			ServerSharekeyLen: uint16(len(serverShareKey)),
@@ -491,7 +498,7 @@ func (d *Daemon) HandShake(session *Session, cHello *ClientHello) (encrypter, de
 
 	transcript := BuildHandshakeTranscript(
 		cHello.ClientRandom,
-		newSessionID,
+		session.ID,
 		cHello.Encryption.CLIENT_KEX_ALGO,
 		cHello.Encryption.CLIENT_CIPHER,
 		serverShareKey,
@@ -512,15 +519,17 @@ func (d *Daemon) HandShake(session *Session, cHello *ClientHello) (encrypter, de
 }
 
 func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
+	log.Printf("container loop running")
 	d.State.ContainerConns.Add(1)
 	defer d.State.ContainerConns.Sub(1)
 
 	for {
 
 		pkt, err := session.ReadPacket()
+		//log.Printf("pkt %x...", session.ID[0:3])
+		session.SetDeadline(time.Now().Add(SESSION_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Printf("[] Error reading packet from Session %x...: %v", session.ID[0:3], err)
-
 			log.Printf("Ending The Session %x... : %v", session.ID[0:3], err)
 			break
 		}
@@ -528,15 +537,19 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 		switch pkt.Payload[0] {
 		case MsgClientGetContainerShell:
 			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
-
+			if err != nil {
+				session.WritePacket(MsgServerFailedToOpenShell, nil)
+				continue
+			}
 			if cop.OpType != ContainerOpShell {
 				return
 			}
 
 			log.Printf("Received [container] Shell Request for container [%s] by [%s]- Req id %v", string(cop.Name), string(cop.PublicKey), cop.RequestID)
-			if err != nil {
-				session.WritePacket(MsgServerFailedToOpenShell, nil)
-				continue
+
+			if !bytes.Equal(cop.PublicKey, session.PublicKey) {
+				session.WritePacket(MsgServerInvalidSignature, nil)
+				return
 			}
 			pubKeyHex := hex.EncodeToString(cop.PublicKey)
 			// 2. Daemon is authoritative! It assigns the Channel ID safely.
@@ -557,8 +570,8 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			}
 
 			if env != nil {
-				pipeStream := NewPipe(chanID, session)
-				session.AddActiveChannel(chanID, pipeStream)
+				pipe := NewPipe(chanID, session)
+				pipeStream := session.AttachChannel(chanID, pipe, false)
 
 				runCh := make(chan struct{}, 1)
 				go func() {
@@ -580,9 +593,9 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 					Success:   true,
 				}
 
-				err = session.WritePacket(MsgServerShellReqResponse, srr.Marshal())
+				err = session.WritePacket(MsgServerShellReqResponse, srr)
 				if err != nil {
-					return
+					continue
 				}
 			}
 
@@ -594,6 +607,10 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			}
 			if cop.OpType != ContainerOpLogs {
 				log.Printf("invaild containerOp code")
+				continue
+			}
+			if !bytes.Equal(cop.PublicKey, session.PublicKey) {
+				session.WritePacket(MsgServerInvalidSignature, nil)
 				return
 			}
 			pubKeyHex := hex.EncodeToString(cop.PublicKey)
@@ -605,36 +622,48 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
 			if err != nil {
 				log.Println(err)
-				return
+				continue
 			}
 
 			if env == nil {
 				log.Printf("%s doesn't exist or belong to this key", string(cop.Name))
 				session.WritePacket(MsgServerNoContainer, nil)
-				return
+				continue
 			}
-			pipeStream := NewPipe(chanID, session)
 
 			co := &ChannelOpen{
 				ChannelID: chanID,
 			}
 
-			session.WritePacket(MsgServerOpenLogChannel, co.Marshal())
-			defer session.WritePacket(MsgServerChannelClosed, co.Marshal())
-
-			session.AddActiveChannelWithConfirmation(chanID, pipeStream)
-
-			//client needs to send MsgClientChannelOpenConfirm
-			if !session.WaitForClientChannelOpenConfirmed(chanID) {
+			werr := session.WritePacket(MsgServerOpenLogChannel, co)
+			if werr != nil {
 				return
 			}
-			log.Printf("client Confirmed channel opened %d", chanID)
 
-			err = d.GetContainerLogs(ctx, env.Name, pipeStream)
+			defer session.WritePacket(MsgServerChannelClosed, co)
 
-			if err != nil {
-				log.Println(err)
-			}
+			//client needs to send MsgClientChannelOpenConfirm
+			/*if !session.WaitForClientChannelOpenConfirmed(chanID) {
+				return
+			}*/
+			//	log.Printf("client Confirmed channel opened %d", chanID)
+			//<-time.After(10 * time.Second)
+			//log.Println("fire")
+			go func() {
+				pipe := NewPipe(chanID, session)
+				pipeStream, ok := session.AttachChannelWithConfirmation(chanID, pipe, false)
+				if !ok {
+					return
+				}
+				defer session.closeChannel(chanID)
+				err = d.GetContainerLogs(ctx, env.Name, pipeStream)
+
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				//log.Println("fire", err)
+			}()
 		case MsgClientContainerCommandExec:
 			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
 			if err != nil {
@@ -642,6 +671,11 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				continue
 			}
 			if cop.OpType != ContainerOpCommand {
+				return
+			}
+
+			if !bytes.Equal(cop.PublicKey, session.PublicKey) {
+				session.WritePacket(MsgServerInvalidSignature, nil)
 				return
 			}
 
@@ -669,27 +703,35 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				return
 			}
 
-			pipeStream := NewPipe(chanID, session)
-			session.AddActiveChannelWithConfirmation(chanID, pipeStream)
+			//pipe := NewPipe(chanID, session)
+			//pipeStream := session.AttachChannel(chanID, pipe, false)
 
 			co := &ChannelOpen{
 				ChannelID: chanID,
 			}
-			session.WritePacket(MsgServerOpenReadChannel, co.Marshal())
-			defer session.WritePacket(MsgServerChannelClosed, co.Marshal())
+			session.WritePacket(MsgServerOpenReadChannel, co)
+			defer session.WritePacket(MsgServerChannelClosed, co)
 
 			//client needs to send MsgClientChannelOpenConfirm
-			if !session.WaitForClientChannelOpenConfirmed(chanID) {
-				return
-			}
+			//	if !session.WaitForClientChannelOpenConfirmed(chanID) {
+			//		return
+			//	}
+
 			log.Printf("client Confirmed channel opened %d", chanID)
+			go func() {
+				pipe := NewPipe(chanID, session)
+				pipeStream, ok := session.AttachChannelWithConfirmation(chanID, pipe, false)
+				if !ok {
+					return
+				}
 
-			command := string(cop.Command)
-			err = d.ContainerExec(ctx, env.Name, command, pipeStream)
-			if err != nil {
-				log.Println(err)
-			}
-
+				defer session.closeChannel(chanID)
+				command := string(cop.Command)
+				err = d.ContainerExec(ctx, env.Name, command, pipeStream)
+				if err != nil {
+					log.Println(err)
+				}
+			}()
 		case MsgClientChanneledData:
 			// CLIENT WRITING DATA BACK TO PUBLIC USER
 			ch, err := ParseChannelData(pkt.Payload[1:])
@@ -702,23 +744,20 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
-
-				switch cc := c.(type) {
-
-				case net.Conn:
-					_, err = cc.Write(ch.Data)
-					if err != nil {
-						log.Printf("Failed to write back to io dev: %v", err)
+				if p, ok := c.(*PipeStream); ok {
+					if _, err := p.Feed(ch.Data); err != nil {
+						// Flow-control violation or closed pipe: drop the channel,
+						// never block the shared reader.
+						log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
+						session.closeChannel(ch.ChannelID)
+						session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
 					}
-				case *PipeStream:
-					// Feed the decrypted data directly into the Channel's read queue!
-					cc.Feed(ch.Data)
-				default:
+				} else {
 					log.Println("Unknown channel type in memory!")
 				}
 			} else {
 				log.Printf("Received Data with unknown Channel ID: %d", ch.ChannelID)
-				go session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
+				session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
 			}
 
 		case MsgClientSessionClosed:
@@ -744,7 +783,34 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 					log.Printf("initial window resize failed %v ", err)
 				}
 			}
+		case MsgWindowAdjust:
+			wa, err := ParseWindowAdjust(pkt.Payload[1:])
+			if err != nil {
+				log.Printf("malformed WindowAdjust")
+				continue
+			}
+			session.grantSendWindow(wa.ChannelID, wa.Increment)
+		case MsgClientChannelOpenConfirm:
 
+			confirm, err := ParseClientChannelOpenConfirm(pkt.Payload[1:])
+
+			if err != nil {
+				log.Printf("Malformed Channel Open Confirmation from client")
+				continue
+			}
+
+			if confirm.Success {
+				session.ConfirmChannelsMu.RLock()
+				ch, ok := session.channelOpenConfirmed[confirm.ChannelID]
+				session.ConfirmChannelsMu.RUnlock()
+				if ok {
+					select {
+					case ch <- confirm.Success:
+					default:
+					} // never block the reader
+				}
+
+			}
 		default:
 			log.Printf("Unknown or corrupted message type: %d", pkt.Payload[0])
 			log.Printf("packet code %d cant be handle", pkt)
@@ -755,6 +821,8 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 	for {
 
 		pkt, err := session.ReadPacket()
+		//log.Printf("pkt msg code [%d]...", uint8(pkt.Payload[0]))
+		session.SetDeadline(time.Now().Add(SESSION_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Printf("[] Error reading packet from Session %x...: %v", session.ID[0:3], err)
 
@@ -787,9 +855,9 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				// Assign a unique ID to this (connection) user
 				chanID := session.IncrementChannelID()
 				// Save the connection so we can write back to it later!
-				session.AddActiveChannel(chanID, uConn)
-				defer session.DeleteActiveChannel(chanID)
-				defer uConn.Close()
+				session.AttachChannel(chanID, uConn, true) // inbound ring -> uConn
+				defer session.closeChannel(chanID)         // closes pipe (=> drain closes uConn)
+				//defer uConn.Close()
 
 				// A. Tell the Client a new user connected!
 				sch := &ServerChannelOpen{
@@ -797,7 +865,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 					RemoteAddr: req.Address,
 				}
 
-				session.WritePacket(MsgServerNewChannelOpened, sch.Marshal())
+				session.WritePacket(MsgServerNewChannelOpened, sch)
 
 				// B. Read from the user, wrap it in a ChannelData packet, and send to Client
 				//buf := make([]byte, MAX_PACKET_LEN)
@@ -812,7 +880,9 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 							ChannelID: chanID,
 							Data:      buf[:n],
 						}
-						session.WritePacket(MsgServerChanneledData, cd.Marshal())
+						if werr := session.WritePacket(MsgServerChanneledData, cd); werr != nil {
+							break
+						}
 					}
 
 					if err != nil {
@@ -821,7 +891,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				}
 				// C. Tell client the web user disconnected
 				ccl := &ChannelClosed{ChannelID: chanID}
-				session.WritePacket(MsgServerChannelClosed, ccl.Marshal())
+				session.WritePacket(MsgServerChannelClosed, ccl)
 			}
 
 			// Run the listener in the background!
@@ -830,7 +900,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 
 			// 3. Reply to the Client
 			res := &ListenResponse{Address: req.Address, Success: err == nil}
-			session.WritePacket(MsgServerListenResponse, res.Marshal())
+			session.WritePacket(MsgServerListenResponse, res)
 
 			if err != nil {
 				log.Printf("Failed to start listener for client on %s: %v", req.Address, err)
@@ -853,23 +923,20 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
-
-				switch cc := c.(type) {
-
-				case net.Conn:
-					_, err = cc.Write(ch.Data)
-					if err != nil {
-						log.Printf("Failed to write back to io dev: %v", err)
+				if p, ok := c.(*PipeStream); ok {
+					if _, err := p.Feed(ch.Data); err != nil {
+						// Flow-control violation or closed pipe: drop the channel,
+						// never block the shared reader.
+						log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
+						session.closeChannel(ch.ChannelID)
+						session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
 					}
-				case *PipeStream:
-					// Feed the decrypted data directly into the Channel's read queue!
-					cc.Feed(ch.Data)
-				default:
+				} else {
 					log.Println("Unknown channel type in memory!")
 				}
 			} else {
 				log.Printf("Received Data with unknown Channel ID: %d", ch.ChannelID)
-				go session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
+				session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
 			}
 
 		case MsgClientShellRequest:
@@ -900,7 +967,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				Success:   err == nil,
 			}
 
-			err = session.WritePacket(MsgServerShellReqResponse, res.Marshal())
+			err = session.WritePacket(MsgServerShellReqResponse, res)
 
 			log.Printf("Shell request response sent for reqID %v: %v", res.RequestID, hex.EncodeToString([]byte{byte(res.ChannelID)}))
 
@@ -915,8 +982,10 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 
 			}
 
-			pipeStream := NewPipe(chanID, session)
-			session.AddActiveChannel(chanID, pipeStream)
+			pipe := NewPipe(chanID, session)
+			//	session.AddActiveChannel(chanID, pipeStream)
+			pipeStream := session.AttachChannel(chanID, pipe, false)
+
 			log.Printf("PipeStream created and added to active channel %d", chanID)
 
 			var shell *ShellRequest
@@ -950,9 +1019,9 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			}
 
 			log.Printf("Client requested forward to %s", fr.Address)
-			d.State.mu.Lock()
+			session.forwardMu.Lock()
 			session.forwardMap[fr.Address] = fr.Address
-			d.State.mu.Unlock()
+			session.forwardMu.Unlock()
 
 		case MsgClientNewChannelOpened:
 			// A public web user connected to the Daemon! We must dial our local target.
@@ -964,24 +1033,23 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			//reject server-namespace IDs from clients
 			if !IsClientChannelID(cco.ChannelID) {
 				log.Printf("Security alert: client tried to open channel with server-namespace ID %d; rejecting", cco.ChannelID)
-				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: cco.ChannelID}).Marshal())
+				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: cco.ChannelID}))
 				continue
 			}
 
-			session.mu.Lock()
+			session.forwardMu.Lock()
 			localTarget, exists := session.forwardMap[cco.RemoteAddr]
-			session.mu.Unlock()
+			session.forwardMu.Unlock()
 
 			if !exists {
 				log.Printf("Security alert: Client requested unknown port %s", cco.RemoteAddr)
-
 				continue
 			}
 
 			// Dial the local server in the background (e.g. 127.0.0.1:8080)
 			go func(channelID uint32, localTarget string) {
-				d := tcp.DefaultDialOptions().NewDialer()
-				c, err := d.Dial(localTarget)
+				dl := tcp.DefaultDialOptions().NewDialer()
+				c, err := dl.Dial(localTarget)
 
 				if err != nil {
 					log.Printf("Failed to connect to remote target for forwarding: %v", err)
@@ -992,11 +1060,11 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				if !session.AddActiveChannelIfAbsent(channelID, c) {
 					log.Printf("Security alert: client requested channel ID %d that is already in use; refusing (possible channel hijack attempt)", channelID)
 					c.Close()
-					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: channelID}).Marshal())
+					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: channelID}))
 					return
 				}
-				defer session.DeleteActiveChannel(channelID)
-				defer c.Close()
+				session.AttachChannel(channelID, c, true)
+				defer session.closeChannel(channelID)
 
 				// read the data from the target and send it back to the client!
 				buf := bufferPool.Get().([]byte)
@@ -1009,16 +1077,16 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 							ChannelID: channelID, // Use the client's ID
 							Data:      buf[:n],
 						}
-						session.WritePacket(MsgServerChanneledData, cd.Marshal())
+						if werr := session.WritePacket(MsgServerChanneledData, cd); werr != nil {
+							break
+						}
 					}
 					if err != nil {
 						break
 					}
 				}
 
-				// Tell client the connection closed
-				ccl := &ChannelClosed{ChannelID: channelID}
-				session.WritePacket(MsgServerChannelClosed, ccl.Marshal())
+				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: channelID}))
 
 			}(cco.ChannelID, localTarget)
 
@@ -1034,20 +1102,12 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			//reject server-namespace IDs from clients
 			if !IsClientChannelID(ccl.ChannelID) {
 				log.Printf("Security alert: client tried to close channel with server-namespace ID %d; rejecting", ccl.ChannelID)
-				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ccl.ChannelID}).Marshal())
+				session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ccl.ChannelID}))
 				continue
 			}
 
 			// Find the active connection and terminate it
-			if channelObj, exists := session.GetActiveChannel(ccl.ChannelID); exists {
-				switch c := channelObj.(type) {
-				case net.Conn:
-					c.Close()
-				case *PipeStream:
-					c.Close()
-				}
-				session.DeleteActiveChannel(ccl.ChannelID)
-			}
+			session.closeChannel(ccl.ChannelID)
 		case MsgClientSessionClosed:
 			session.Close()
 			log.Printf("MsgClientSessionClosed")
@@ -1071,6 +1131,14 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 					log.Printf("initial window resize failed %v ", err)
 				}
 			}
+		case MsgWindowAdjust:
+			wa, err := ParseWindowAdjust(pkt.Payload[1:])
+			if err != nil {
+				log.Printf("malformed WindowAdjust")
+				continue
+			}
+			//log.Printf("packet WindowAdjust recieved on channel %d", wa.ChannelID)
+			session.grantSendWindow(wa.ChannelID, wa.Increment)
 
 		default:
 			log.Printf("Unknown or corrupted message type: %d", pkt.Payload[0])
@@ -1212,7 +1280,7 @@ func encryptSession(cHello *ClientHello, session *Session, ID []byte) (cipher.AE
 	return enc, dec, serverShareKey, nil
 }
 
-func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error) {
+func (d *Daemon) shellAuth(session *Session, aPkt *PacketFrame) (*AuthResponse, error) {
 	var authUsername string
 	var user string
 	ar := &AuthResponse{Success: false}
@@ -1238,42 +1306,18 @@ func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error
 
 		user = authReq.Username
 		var AuthorizedKeysPath string
-		if isTempUser(authReq.Username) && d.DB.HasActiveEnv(string(authReq.PublicKey), "system-user") {
-			user = authReq.Username
-			//env, err := d.DB.GetENVByname(user, string(authReq.PublicKey))
-			//return nil, errors.New("temp user dosent exists. Skipping.")
-			AuthorizedKeysPath = "/etc/shellforge/authorized_env_keys"
-		}
-
-		env, err := d.DB.GetENVByUserReqestedName(authReq.Username, string(authReq.PublicKey))
-		if err == nil && env != nil { //a temp user but using user requeted name - alais
-			if d.DB.HasActiveEnv(string(authReq.PublicKey), "system-user") {
-				user = env.Name
-				AuthorizedKeysPath = "/etc/shellforge/authorized_env_keys"
-			} else {
-				return nil, errors.New(" user has no active envs ")
-			}
-		}
-
-		if err == ErrFailedToQueryByReqNmae { //temp user but falid to query
-			return nil, err
-		}
 
 		if user == "root" {
 			AuthorizedKeysPath = "/root/.shellforge/authorized_keys"
 		}
 
-		if user != "root" && !isTempUser(user) {
+		if user != "root" {
 			p, perr := AuthorizedKeysPathForUser(authReq.Username)
 			if perr != nil {
 				log.Printf("PublicKey auth failed for user %s: %v", authReq.Username, perr)
 				return nil, perr
 			}
 			AuthorizedKeysPath = p
-		}
-
-		if d.Conf.AuthorizedKeysPath != "" {
-			AuthorizedKeysPath = d.Conf.AuthorizedKeysPath
 		}
 
 		log.Printf("authorized key dir for user %s is %s", user, AuthorizedKeysPath)
@@ -1293,7 +1337,7 @@ func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error
 
 		authUsername = user
 		ar.Username = authUsername
-		ar.Type = AuthMethodPublicKey
+		ar.AuthType = AuthMethodPublicKey
 		ar.Success = true
 
 		session.authMethod = AuthMethodPublicKey
@@ -1327,7 +1371,7 @@ func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error
 
 		authUsername = authReq.Username
 		ar.Username = authUsername
-		ar.Type = AuthMethodPassword
+		ar.AuthType = AuthMethodPassword
 		ar.Success = true
 
 		session.authMethod = AuthMethodPassword
@@ -1360,7 +1404,7 @@ func (d *Daemon) shellAuth(session *Session, aPkt *Packet) (*AuthResponse, error
 
 		authUsername = username
 		ar.Username = authUsername
-		ar.Type = AuthMethodPKI
+		ar.AuthType = AuthMethodPKI
 		ar.Success = true
 		session.authMethod = AuthMethodPKI
 		return ar, nil
@@ -1663,7 +1707,10 @@ func Start(conf DaemonConfig) {
 	if hostKeyPath == "" {
 		hostKeyPath = "/etc/shellforge/host_ed25519"
 	}
-
+	// Let the user dictate if this client is allowed based on their Init string
+	if d.Conf.ClientInitHandler == nil {
+		d.Conf.ClientInitHandler = d.DefaultClientInitHandler()
+	}
 	hostKey, err := LoadOrCreateHostKey(hostKeyPath)
 
 	if err != nil {
@@ -1681,9 +1728,6 @@ func Start(conf DaemonConfig) {
 		supportedAuths |= AuthMethodPublicKey
 	}
 
-	if d.Conf.AuthorizedKeysPath == "" && d.Conf.PublicKeyAuth {
-		d.Conf.AuthorizedKeysPath = "root/.shellforge/authorized_keys"
-	}
 	if d.Conf.PasswordAuth { // Assuming PAM fallback configured
 		supportedAuths |= AuthMethodPassword
 	}
@@ -1996,23 +2040,12 @@ func (d *Daemon) GetContainerLogs(ctx context.Context, containerName string, w i
 		return fmt.Errorf("container %q does not exist", containerName)
 	}
 
-	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "podman", "logs", "--timestamps", containerName)
+	cmd := exec.CommandContext(ctx, "podman", "logs", "--timestamps", "-f", containerName)
 	cmd.Stdout = w
-	cmd.Stderr = &stderr // podman logs writes to stderr too, capture separately
+	cmd.Stderr = w
 
 	if err := cmd.Run(); err != nil {
-		podmanErr := strings.TrimSpace(stderr.String())
-		if podmanErr != "" {
-			return fmt.Errorf("podman logs failed: %w (stderr: %s)", err, podmanErr)
-		}
 		return fmt.Errorf("podman logs failed: %w", err)
-	}
-
-	// podman logs writes actual log lines to stderr (not stdout) by default —
-	// flush stderr content to w as well so the caller gets everything.
-	if stderr.Len() > 0 {
-		_, _ = w.Write(stderr.Bytes())
 	}
 	return nil
 }

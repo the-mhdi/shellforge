@@ -106,10 +106,7 @@ func DeleteSystemUser(username string) error {
 }
 
 func isTempUser(username string) bool {
-	if strings.HasPrefix(username, "TEMPSHELL_USER_PREFIX") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(username, TEMPSHELL_USER_PREFIX)
 }
 
 // sqlite tabe for user management

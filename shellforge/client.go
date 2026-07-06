@@ -85,7 +85,7 @@ type Client struct {
 	pendingContainerLists map[uint32]chan *ContainersListResponse
 	PendingAuthResponse   chan *AuthResponse
 	AuthResCh             chan struct{}
-	PendingResponse       chan Packet
+	PendingResponse       chan PacketFrame
 	// State
 	mu      sync.RWMutex
 	context context.Context
@@ -144,7 +144,7 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 		pendingContainerLists: make(map[uint32]chan *ContainersListResponse),
 		PendingAuthResponse:   make(chan *AuthResponse),
 		AuthResCh:             make(chan struct{}),
-		PendingResponse:       make(chan Packet),
+		PendingResponse:       make(chan PacketFrame),
 		context:               ctx,
 		cancel:                cancel,
 	}
@@ -165,7 +165,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 	// ==========================================
 	// PHASE 1: INIT EXCHANGE
 	// ==========================================
-	if err := tempSession.WritePacket(MsgClientInit, []byte(c.conf.ClientInitMessage)); err != nil {
+	if err := tempSession.WritePacketRaw(MsgClientInit, []byte(c.conf.ClientInitMessage)); err != nil {
 		return err
 	}
 
@@ -278,7 +278,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 
 	}
 
-	if err := tempSession.WritePacket(MsgClientHello, cHello.Marshal()); err != nil {
+	if err := tempSession.WritePacket(MsgClientHello, cHello); err != nil {
 		return err
 	}
 
@@ -304,7 +304,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 
 		// Because we use c.session, this WritePacket is AUTOMATICALLY ENCRYPTED
 		// using our existing AES-GCM keys. The server will verify the MAC!
-		if err := c.session.WritePacket(MsgClientResumeProof, proof.Marshal()); err != nil {
+		if err := c.session.WritePacket(MsgClientResumeProof, proof); err != nil {
 			return fmt.Errorf("failed to send resume proof: %w", err)
 		}
 
@@ -455,7 +455,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 	// ==========================================
 	// PHASE 1: INIT EXCHANGE
 	// ==========================================
-	if err := tempSession.WritePacket(MsgClientInit, c.InitMsg); err != nil {
+	if err := tempSession.WritePacketRaw(MsgClientInit, c.InitMsg); err != nil {
 		return err
 	}
 	log.Printf("[Log] Client Init Sent: %s", string(c.InitMsg))
@@ -567,7 +567,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 	}
 
-	if err := tempSession.WritePacket(MsgClientHello, cHello.Marshal()); err != nil {
+	if err := tempSession.WritePacket(MsgClientHello, cHello); err != nil {
 		return err
 	}
 
@@ -593,7 +593,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 		// Because we use c.session, this WritePacket is AUTOMATICALLY ENCRYPTED
 		// using our existing AES-GCM keys. The server will verify the MAC!
-		if err := c.session.WritePacket(MsgClientResumeProof, proof.Marshal()); err != nil {
+		if err := c.session.WritePacket(MsgClientResumeProof, proof); err != nil {
 			return fmt.Errorf("failed to send resume proof: %w", err)
 		}
 
@@ -756,7 +756,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 							Signature: signature,
 						}
 
-						c.session.WritePacket(MsgClientAuthPub, PubAuthReq.Marshal())
+						c.session.WritePacket(MsgClientAuthPub, PubAuthReq)
 						log.Printf("Client sent public key authentication request for user: %s", username)
 
 						pkt, err := c.session.ReadPacket()
@@ -773,7 +773,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 							return fmt.Errorf("failed to parse authentication response: %w", err)
 						}
 
-						if ar.Success && ar.Type == AuthMethodPublicKey && ar.Username == username {
+						if ar.Success && ar.AuthType == AuthMethodPublicKey && ar.Username == username {
 							log.Println("[Success] pubkey login succeeded!")
 							authsuccess = true
 							break authLoop
@@ -807,7 +807,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 						Signature:   signature,
 					}
 
-					c.session.WritePacket(MsgClientAuthPKI, pkiReq.Marshal())
+					c.session.WritePacket(MsgClientAuthPKI, pkiReq)
 
 					pkt, err := c.session.ReadPacket()
 					if pkt.Payload[0] != MsgServerAuthResponse {
@@ -823,7 +823,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 						return fmt.Errorf("failed to parse authentication response: %w", err)
 					}
 
-					if ar.Success && ar.Type == AuthMethodPKI && ar.Username == username {
+					if ar.Success && ar.AuthType == AuthMethodPKI && ar.Username == username {
 						log.Println("[Success] PKI Certificate login succeeded!")
 						authsuccess = true
 						break authLoop
@@ -853,7 +853,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 						Password: string(passBytes),
 					}
 
-					if err := c.session.WritePacket(MsgClientAuthPassword, PassAuthReq.Marshal()); err != nil {
+					if err := c.session.WritePacket(MsgClientAuthPassword, PassAuthReq); err != nil {
 						return err
 					}
 					pkt, err := c.session.ReadPacket()
@@ -884,7 +884,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 						return fmt.Errorf("failed to parse authentication response: %w", err)
 					}
 
-					if ar.Success && ar.Type == AuthMethodPassword && ar.Username == username {
+					if ar.Success && ar.AuthType == AuthMethodPassword && ar.Username == username {
 						log.Println("[Success] passwd login succeeded!")
 						authsuccess = true
 						break authLoop
@@ -899,7 +899,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 			return errors.New("AUTH FAILED!")
 		}
 
-	} else {
+	} /*else {
 		// --- RESUMING SUCCESS ---
 		if !sHello.SessionResumed {
 			c.mu.Lock()
@@ -908,7 +908,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 			return errors.New("[Error] server rejected session resumption, session expired")
 		}
 		log.Printf("[Log] Session %x Successfully Resumed!", c.session.ID)
-	}
+	}*/
 
 	c.session.User = username
 
@@ -929,7 +929,7 @@ func (c *Client) eventLoop() {
 		pkt, err := c.session.ReadPacket()
 		if err != nil {
 			log.Printf("Disconnected From Server: %v\r\n", err)
-			c.session.conn.Close()
+			c.session.closeConn()
 			break
 		}
 
@@ -952,15 +952,15 @@ func (c *Client) eventLoop() {
 				log.Printf("[Error] failed to open log channel: %v", err)
 				continue
 			}
-
-			c.session.AddActiveChannel(ch.ChannelID, os.Stdout)
+			// Buffer server logs in a ring, drained to stdout with the "[Server LOG]: "
+			// prefix. false => never close os.Stdout when the channel ends.
+			c.session.AttachChannel(ch.ChannelID,
+				os.Stdout, false)
 			log.Printf("Server Log channel Opened, %d", ch.ChannelID)
-			confirm := &ClientChannelOpenConfirm{
-				ChannelID: ch.ChannelID,
-				Success:   true,
-			}
-			c.session.WritePacket(MsgClientChannelOpenConfirm, confirm.Marshal())
-			defer c.session.DeleteActiveChannel(ch.ChannelID)
+
+			confirm := &ClientChannelOpenConfirm{ChannelID: ch.ChannelID, Success: true}
+			c.session.WritePacket(MsgClientChannelOpenConfirm, confirm)
+			defer c.session.closeChannel(ch.ChannelID)
 
 		case MsgServerNewChannelOpened:
 			// A public web user connected to the Daemon! We must dial our local target.
@@ -987,33 +987,21 @@ func (c *Client) eventLoop() {
 			if err != nil {
 				continue
 			}
-
 			if ac, exists := c.session.GetActiveChannel(cd.ChannelID); exists {
-				switch ch := ac.(type) {
-				case net.Conn:
-					ch.Write(cd.Data)
-				case *PipeStream:
-					ch.Feed(cd.Data)
-				case *os.File:
-					s := []byte("[Server LOG]: ")
-					cd.Data = append(s, cd.Data...)
-					ch.Write(cd.Data)
+				if p, ok := ac.(*PipeStream); ok {
+					if _, err := p.Feed(cd.Data); err != nil {
+						log.Printf("channel %d feed failed: %v; closing", cd.ChannelID, err)
+						c.session.closeChannel(cd.ChannelID)
+						c.session.WritePacket(MsgClientChannelClosed,
+							(&ChannelClosed{ChannelID: cd.ChannelID}))
+					}
 				}
 			}
 
 		case MsgServerChannelClosed:
 			// The remote user disconnected
-			ccl, err := ParseChannelClosed(pkt.Payload[1:])
-			if err == nil {
-				if channelObj, exists := c.session.GetActiveChannel(ccl.ChannelID); exists {
-					switch ch := channelObj.(type) {
-					case net.Conn:
-						ch.Close()
-					case *PipeStream:
-						ch.Close()
-					}
-					c.session.DeleteActiveChannel(ccl.ChannelID)
-				}
+			if ccl, err := ParseChannelClosed(pkt.Payload[1:]); err == nil {
+				c.session.closeChannel(ccl.ChannelID)
 			}
 
 		case MsgServerShellReqResponse:
@@ -1034,7 +1022,7 @@ func (c *Client) eventLoop() {
 			}
 			c.mu.Unlock()
 		case MsgServerChannelUnknownOrClosed:
-			c.session.conn.Close()
+			c.session.closeConn()
 		case MsgServerAuthSuccess:
 
 			log.Println("[Success] Logged in successfully!")
@@ -1081,12 +1069,45 @@ func (c *Client) eventLoop() {
 		case MsgServerNoContainer:
 			log.Printf("MsgServerNoContainer!")
 			return
+
+		case MsgWindowAdjust:
+			if wa, err := ParseWindowAdjust(pkt.Payload[1:]); err == nil {
+				c.session.grantSendWindow(wa.ChannelID, wa.Increment)
+			}
+
 		default:
 			log.Printf("Unknown message from Daemon: %d", pkt.Payload[0])
 		}
 	}
 
 }
+
+// handleIncomingTunnel is called when the daemon tells us a web user connected.
+func (c *Client) handleIncomingTrafiic(channelID uint32, localTarget string) {
+	localConn, err := c.dialer.Dial(localTarget)
+	if err != nil {
+		log.Printf("Failed to dial local target %s: %v", localTarget, err)
+		return
+	}
+
+	c.session.AttachChannel(channelID, localConn, true) // inbound ring -> localConn
+	defer c.session.closeChannel(channelID)
+
+	buf := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buf)
+	for {
+		n, err := localConn.Read(buf)
+		if n > 0 {
+			if werr := c.session.SendChannelData(MsgClientChanneledData, channelID, buf[:n]); werr != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
 func (c *Client) verifyServerIdentity(sHello *ServerHello, clientRandom []byte, kexAlgo, cipher uint16) error {
 	if c.conf != nil && c.conf.InsecureSkipHostKeyVerify {
 		log.Printf("[Security][WARNING] Host key verification DISABLED ... vulnerable to active MITM!")
@@ -1126,37 +1147,6 @@ func (c *Client) knownHostsPath() string {
 	return DefaultKnownHostsPath()
 }
 
-// handleIncomingTunnel is called when the daemon tells us a web user connected.
-func (c *Client) handleIncomingTrafiic(channelID uint32, localTarget string) {
-	localConn, err := c.dialer.Dial(localTarget)
-	if err != nil {
-		log.Printf("Failed to dial local target %s: %v", localTarget, err)
-		return
-	}
-
-	c.session.AddActiveChannel(channelID, localConn)
-	defer c.session.DeleteActiveChannel(channelID)
-	defer localConn.Close()
-
-	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf)
-
-	for {
-		n, err := localConn.Read(buf)
-		if n > 0 {
-			cd := &Channel{
-				ChannelID: channelID,
-				Data:      buf[:n],
-			}
-			c.session.WritePacket(MsgClientChanneledData, cd.Marshal())
-		}
-		if err != nil {
-			break
-		}
-	}
-
-}
-
 // ForwardRemoteToLocal (`ssh -R`) tells the Daemon to listen on `remotePort` and route to `localTarget`.
 func (c *Client) ForwardRemoteToLocal(remotePort string, localTarget string) error {
 	c.mu.Lock()
@@ -1168,7 +1158,7 @@ func (c *Client) ForwardRemoteToLocal(remotePort string, localTarget string) err
 		Address: remotePort,
 	}
 
-	return c.session.WritePacket(MsgClientListenRequest, req.Marshal())
+	return c.session.WritePacket(MsgClientListenRequest, req)
 }
 
 // ForwardLocalToRemote (`ssh -L`) opens a port on this laptop and pushes it to a target via the Daemon.
@@ -1176,41 +1166,30 @@ func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr strin
 
 	handler := func(ctx context.Context, localConn net.Conn) {
 		chanID := c.session.IncrementClientChannelID()
-		c.session.AddActiveChannel(chanID, localConn)
-		defer c.session.DeleteActiveChannel(chanID)
-		defer localConn.Close()
+		c.session.AttachChannel(chanID, localConn, true)
+		defer c.session.closeChannel(chanID)
 
-		// 1. Tell Daemon to dial the remote target
-		// (Note: You need to add `MsgClientOpenChannel` to your daemon event loop to handle this!)
 		req := &ClientChannelOpen{
 			ChannelID:  chanID,
 			AddrLen:    uint16(len(remoteTarget)),
 			RemoteAddr: remoteTarget,
 		}
+		c.session.WritePacket(MsgClientNewChannelOpened, req)
 
-		c.session.WritePacket(MsgClientNewChannelOpened, req.Marshal())
-
-		// 2. Read from local connection, send to daemon
-		pool := tcp.BufferPool(MAX_PACKET_LEN)
-		buf := pool.Get().([]byte)
-		defer pool.Put(buf)
-
+		buf := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buf)
 		for {
 			n, err := localConn.Read(buf)
 			if n > 0 {
-				cd := &Channel{
-					ChannelID: chanID,
-					Data:      buf[:n],
+				if werr := c.session.SendChannelData(MsgClientChanneledData, chanID, buf[:n]); werr != nil {
+					break
 				}
-				c.session.WritePacket(MsgClientChanneledData, cd.Marshal())
 			}
 			if err != nil {
 				break
 			}
 		}
-
-		ccl := &ChannelClosed{ChannelID: chanID}
-		c.session.WritePacket(MsgClientChannelClosed, ccl.Marshal())
+		c.session.WritePacket(MsgClientChannelClosed, (&ChannelClosed{ChannelID: chanID}))
 	}
 
 	ln := tcp.DefaultListenOptions().WithVerbose(true)
@@ -1251,7 +1230,7 @@ func (c *Client) RequestShell(shellPath, username string) error {
 	c.mu.Unlock()
 
 	// 3. Send the request to the Daemon
-	if err := c.session.WritePacket(MsgClientShellRequest, req.Marshal()); err != nil {
+	if err := c.session.WritePacket(MsgClientShellRequest, req); err != nil {
 		c.mu.Lock()
 		delete(c.pendingShells, reqID)
 		c.mu.Unlock()
@@ -1292,13 +1271,14 @@ func (c *Client) RequestShell(shellPath, username string) error {
 	}
 	stdinFd := int(os.Stdin.Fd())
 
-	stream := NewPipe(res.ChannelID, c.session)
-	c.session.AddActiveChannel(res.ChannelID, stream)
+	pipe := NewPipe(res.ChannelID, c.session)
 
+	stream := c.session.AttachChannel(res.ChannelID, pipe, false)
+	defer c.session.closeChannel(res.ChannelID)
 	log.Printf("Client Shell Pipe Created, With Channel ID %d \r\n", res.ChannelID)
 
-	defer c.session.DeleteActiveChannel(res.ChannelID)
-	defer stream.Close()
+	//defer c.session.DeleteActiveChannel(res.ChannelID)
+	//defer stream.Close()
 
 	// ========================================================
 	// TERMINAL RAW MODE
@@ -1336,7 +1316,7 @@ func (c *Client) RequestShell(shellPath, username string) error {
 						Cols:      uint16(cols),
 					}
 					// Send the new size to the daemon!
-					c.session.WritePacket(MsgClientWindowResize, resizeReq.Marshal())
+					c.session.WritePacket(MsgClientWindowResize, resizeReq)
 				}
 
 			case <-shellDone:
@@ -1398,7 +1378,7 @@ func (c *Client) CreateENV(envType, RequestedName string, prvKey crypto.Signer) 
 			UserRequestedName:    []byte(RequestedName),
 		}
 
-		c.session.WritePacket(MsgClientENVCreate, req.Marshal())
+		c.session.WritePacket(MsgClientENVCreate, req)
 
 		log.Printf("[Log] env request sent for public key : %s ", hex.EncodeToString(publicKey))
 		return nil
@@ -1431,7 +1411,7 @@ func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) 
 			UserRequestedName:    []byte(containerName),
 		}
 
-		if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+		if err := c.session.WritePacket(MsgClientConnectContainer, req); err != nil {
 			return err
 		}
 		cols, rows, _ := term.GetSize(stdinFd)
@@ -1446,7 +1426,7 @@ func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) 
 			Cols:      uint16(cols),
 		}
 
-		if err := c.session.WritePacket(MsgClientGetContainerShell, shellreq.Marshal()); err != nil {
+		if err := c.session.WritePacket(MsgClientGetContainerShell, shellreq); err != nil {
 			return err
 		}
 
@@ -1504,10 +1484,10 @@ func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) 
 
 // startInteractivePTY consolidates the raw terminal setting and stream copying
 func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
-	stream := NewPipe(channelID, c.session)
-	c.session.AddActiveChannel(channelID, stream)
-	defer c.session.DeleteActiveChannel(channelID)
-	defer stream.Close()
+	pipe := NewPipe(channelID, c.session)
+	stream := c.session.AttachChannel(channelID, pipe, false)
+	defer c.session.closeChannel(channelID)
+	//defer stream.Close()
 
 	oldState, err := term.MakeRaw(stdinFd)
 	if err != nil {
@@ -1531,7 +1511,7 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 						Rows:      uint16(rows),
 						Cols:      uint16(cols),
 					}
-					c.session.WritePacket(MsgClientWindowResize, resizeReq.Marshal())
+					c.session.WritePacket(MsgClientWindowResize, resizeReq)
 				}
 			case <-shellDone:
 				return
@@ -1572,7 +1552,7 @@ func (c *Client) GetContainerLogs(ctx context.Context, name string, signer crypt
 		UserRequestedName:    []byte(name),
 	}
 
-	if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+	if err := c.session.WritePacket(MsgClientConnectContainer, req); err != nil {
 		return err
 	}
 
@@ -1584,7 +1564,7 @@ func (c *Client) GetContainerLogs(ctx context.Context, name string, signer crypt
 		Name:      []byte(name),
 	}
 
-	return c.session.WritePacket(MsgClientContainerLog, conR.Marshal())
+	return c.session.WritePacket(MsgClientContainerLog, conR)
 }
 
 // //func (c *Client) GetContainerInspect(ctx context.Context, name string, signer crypto.Signer) error{}
@@ -1611,7 +1591,7 @@ func (c *Client) ContainerExec(ctx context.Context, name, command string, signer
 		UserRequestedName:    []byte(name),
 	}
 
-	if err := c.session.WritePacket(MsgClientConnectContainer, req.Marshal()); err != nil {
+	if err := c.session.WritePacket(MsgClientConnectContainer, req); err != nil {
 		return err
 	}
 	conR := &ContainerOpRequest{
@@ -1624,7 +1604,7 @@ func (c *Client) ContainerExec(ctx context.Context, name, command string, signer
 		Command:    []byte(command),
 	}
 
-	return c.session.WritePacket(MsgClientContainerCommandExec, conR.Marshal())
+	return c.session.WritePacket(MsgClientContainerCommandExec, conR)
 }
 
 // loadKeys scans configDir for all usable private key files (any filename,
@@ -1747,4 +1727,26 @@ func loadPrivateKeyPEM(path string, name string) (crypto.Signer, error) {
 		return nil, errors.New("private key does not support signing")
 	}
 	return signer, nil
+}
+
+///////////////helpers
+
+type prefixWriter struct {
+	w      io.Writer
+	prefix []byte
+}
+
+func (p prefixWriter) Write(b []byte) (int, error) {
+	if _, err := p.w.Write(p.prefix); err != nil {
+		return 0, err
+	}
+	return p.w.Write(b)
+}
+
+func (p prefixWriter) Read([]byte) (int, error) {
+	return 0, nil
+}
+
+func (p prefixWriter) Close() error {
+	return nil
 }

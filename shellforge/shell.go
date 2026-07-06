@@ -305,8 +305,14 @@ func (srr *ShellRequestResponse) Marshal() []byte {
 
 // getSysCredentials looks up the system UID, GID, and all supplementary groups
 func getSysCredentials(u *user.User) (*syscall.Credential, error) {
-	uid, _ := strconv.ParseUint(u.Uid, 10, 32)
-	gid, _ := strconv.ParseUint(u.Gid, 10, 32)
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("bad uid %q: %w", u.Uid, err)
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("bad gid %q: %w", u.Gid, err)
+	}
 
 	gids, err := u.GroupIds()
 	var groups []uint32

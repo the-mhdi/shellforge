@@ -19,7 +19,6 @@ type PipeStream struct {
 
 	mu       sync.Mutex
 	notEmpty *sync.Cond // signaled when data arrives or the pipe closes
-	notFull  *sync.Cond // signaled when space frees up or the pipe closes
 	ring     []byte     // preallocated ring storage
 	r        int        // index of the next byte to read
 	w        int        // index of the next byte to write
@@ -37,7 +36,6 @@ func NewPipe(id uint32, s *Session) *PipeStream {
 		ring:    make([]byte, PIPE_RING_CAPACITY),
 	}
 	p.notEmpty = sync.NewCond(&p.mu)
-	p.notFull = sync.NewCond(&p.mu)
 	return p
 }
 
@@ -85,18 +83,24 @@ func (p *PipeStream) pop(b []byte) int {
 
 func (p *PipeStream) Read(b []byte) (int, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	for p.size == 0 && !p.closed {
 		p.notEmpty.Wait()
 	}
 	if p.size == 0 {
 		// Closed and fully drained.
+		p.mu.Unlock()
 		return 0, io.EOF
 	}
 
 	n := p.pop(b)
-	p.notFull.Signal()
+	p.mu.Unlock()
+
+	// Credit the peer for the bytes we just removed from the ring. Done OUTSIDE
+	// p.mu (returnRecvWindow may write a WindowAdjust to the socket) and off the
+	// shared read loop, so a slow control write can never deadlock delivery.
+	if n > 0 && p.session != nil {
+		_ = p.session.returnRecvWindow(p.id, n)
+	}
 	return n, nil
 }
 
@@ -105,7 +109,10 @@ func (p *PipeStream) Write(b []byte) (int, error) {
 	if p.session.isDaemon {
 		mt = MsgServerChanneledData
 	}
-	if err := p.session.writeChannelData(mt, p.id, b); err != nil {
+	// SendChannelData blocks HERE (in the caller's goroutine, e.g. the PTY->pipe
+	// copy) when the peer's receive window is exhausted -- exactly the desired
+	// backpressure, applied off the shared read loop.
+	if err := p.session.SendChannelData(mt, p.id, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -119,7 +126,7 @@ func (p *PipeStream) Close() error {
 		// Wake EVERY waiter on both conditions: blocked Feeds return
 		// io.ErrClosedPipe, blocked Reads drain leftovers and then hit EOF.
 		p.notEmpty.Broadcast()
-		p.notFull.Broadcast()
+
 	}
 	p.mu.Unlock()
 	return nil
@@ -127,25 +134,26 @@ func (p *PipeStream) Close() error {
 
 // Feed is called by the main Event Loop when a packet arrives for this Channel ID
 func (p *PipeStream) Feed(data []byte) (int, error) {
-	total := 0
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for len(data) > 0 {
-		for p.size == len(p.ring) && !p.closed {
-			p.notFull.Wait()
-		}
-		if p.closed {
-			return total, io.ErrClosedPipe
-		}
+	if p.closed {
+		return 0, io.ErrClosedPipe
+	}
 
-		n := p.push(data)
-		data = data[n:]
-		total += n
+	free := len(p.ring) - p.size
+	if len(data) > free {
+		// Never block the reader: report the violation instead.
+		return 0, ErrFlowControlWindowOverflow
+	}
+
+	n := p.push(data)
+	if n > 0 {
 		p.notEmpty.Signal()
 	}
-	return total, nil
+
+	return n, nil
 }
 
 // SetPTY associates the active OS PTY file with this Pipe.

@@ -2,15 +2,15 @@ package shellforge
 
 import "fmt"
 
-type MsgPacket interface {
+type Packet interface {
 	Type() uint8
 	Marshal() []byte
 	Unmarshal(data []byte) error
 }
 
 // instantiates the correct Go struct, and parses the binary payload.
-func UnmarshalPacket(msgType uint8, data []byte) (MsgPacket, error) {
-	var msg MsgPacket
+func UnmarshalPacket(msgType uint8, data []byte) (Packet, error) {
+	var msg Packet
 
 	switch msgType {
 	case MsgClientHello:

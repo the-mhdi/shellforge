@@ -211,8 +211,12 @@ func (r *PKIAuthRequest) Marshal() []byte {
 type AuthResponse struct {
 	UserLen  uint16
 	Username string
-	Type     uint8
+	AuthType uint8
 	Success  bool
+}
+
+func (p *AuthResponse) Type() uint8 {
+	return MsgServerAuthResponse
 }
 
 // ParseAuthResponse is a lightweight helper that instantiates an AuthResponse
@@ -246,7 +250,7 @@ func (ar *AuthResponse) Unmarshal(data []byte) error {
 	offset += int(ar.UserLen)
 
 	// 3. Read Type (1 byte)
-	ar.Type = data[offset]
+	ar.AuthType = data[offset]
 	offset += 1
 
 	// 4. Read Success (1 byte boolean)
@@ -269,7 +273,7 @@ func (ar *AuthResponse) Marshal() []byte {
 
 	// Write Type (placed immediately after the variable string)
 	typeOffset := 2 + len(ar.Username)
-	out[typeOffset] = ar.Type
+	out[typeOffset] = ar.AuthType
 
 	// Write Success flag (at the very last byte)
 	successOffset := 3 + len(ar.Username)

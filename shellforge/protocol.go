@@ -21,7 +21,10 @@ var ErrCanNotParseMalformedPacket = errors.New("ErrCanNotParseMalformedPacket")
 //   - server-initiated IDs: high bit CLEAR (0x0000_0001 .. 0x7FFF_FFFF)
 //   - client-initiated IDs: high bit SET   (0x8000_0001 .. 0xFFFF_FFFF)
 const ClientChannelIDBit uint32 = 1 << 31
-const CHANNEL_CONFIRM_TIMEOUT = 5 * time.Second
+const MAX_WAIT_FOR_CHAN_CONFIRM = 5 * time.Second
+const SESSION_DEADLINE_DEDAULT = 15 * time.Minute
+const SESSION_HANDSHAKE_DEADLINE_DEDAULT = 1 * time.Minute
+
 const (
 	AuthMethodPassword  uint8 = 0x01 // 1 << 0 (0000 0001) - Password/PAM
 	AuthMethodPublicKey uint8 = 0x02 // 1 << 1 (0000 0010) - Raw Ed25519
@@ -84,7 +87,7 @@ const (
 	MsgClientNewChannelOpened uint8 = 52
 
 	MsgServerForwardReqMalformed    uint8 = 166
-	MsgServerChannelUnknownOrClosed uint8 = 205
+	MsgServerChannelUnknownOrClosed uint8 = 219
 
 	MsgServerChanneledData      uint8 = 200
 	MsgClientChanneledData      uint8 = 201
@@ -149,9 +152,10 @@ const (
 	MsgClient = 9
 
 	MsgServerOpenReadChannel = 212
+	MsgWindowAdjust          = 24
 )
 
-type Packet struct {
+type PacketFrame struct {
 	PacketLength uint32
 
 	PaddingLength uint8
@@ -173,11 +177,15 @@ type Session struct {
 	isDaemon bool     // 1=daemon , 0 = client
 	conn     net.Conn //connection between server <-> client
 
+	//shells   []*Shell
 	// Multiplexing
+	flows   map[uint32]*chanFlow
+	flowsMu sync.Mutex
+
 	channelCounter       atomic.Uint32
 	activeChannelsMu     sync.RWMutex
 	activeChannels       map[uint32]io.ReadWriteCloser //map[chanID]*pipe map[chanID]net.conn  //connection between server/client and their users/io devices
-	channelOpenConfirmed map[uint32]bool               // Tracks which channels have been confirmed open by client
+	channelOpenConfirmed map[uint32]chan bool          // Tracks which channels have been confirmed open by client
 	ConfirmChannelsMu    sync.RWMutex
 	// Cryptography
 	encrypter cipher.AEAD
@@ -186,9 +194,10 @@ type Session struct {
 	writeSeq uint64 // Tracks packets sent
 	readSeq  uint64 // Tracks packets received
 
-	rdLen   [4]byte // stack-ish, no heap alloc
-	rdNonce []byte  // allocated once == decrypter.NonceSize()
-	rdBuf   []byte  // reused, cap == MAX_PACKET_LEN
+	rdLen       [4]byte // stack-ish, no heap alloc
+	rdNonce     []byte  // allocated once == decrypter.NonceSize()
+	rdBuf       []byte  // reused, cap == MAX_PACKET_LEN
+	readerOwner atomic.Int32
 
 	writeMu sync.Mutex // Serializes seq++ -> Seal -> conn.Write so concurrent writers can't reuse a nonce or interleave frames
 	wrNonce []byte
@@ -198,9 +207,10 @@ type Session struct {
 	authMethod uint8             //publicKey, Password, PKI
 	PublicKey  []byte            // 32 bytes (Ed25519) //used for session resume proof]
 	forwardMap map[string]string // Maps Remote Requested Port -> Local Target Port
-	shells     []*Shell
-	mu         sync.Mutex // Protects the TCP connection swap for session resume and close
-	closeOnce  sync.Once
+	forwardMu  sync.RWMutex
+
+	mu        sync.Mutex // Protects the TCP connection swap for session resume and close
+	closeOnce sync.Once
 
 	Closed chan struct{} // Signals when the session is closed (used by Dialer to unblock)
 
@@ -210,13 +220,19 @@ func NewSession(conn net.Conn) *Session {
 	return &Session{
 		conn:                 conn,
 		activeChannels:       make(map[uint32]io.ReadWriteCloser),
-		channelOpenConfirmed: make(map[uint32]bool),
+		flows:                make(map[uint32]*chanFlow),
+		channelOpenConfirmed: make(map[uint32]chan bool, 1),
 		forwardMap:           make(map[string]string),
 		Closed:               make(chan struct{}),
 	}
 }
 
-func (s *Session) ReadPacket() (*Packet, error) {
+func (s *Session) ReadPacket() (*PacketFrame, error) {
+
+	if !s.readerOwner.CompareAndSwap(0, 1) {
+		return nil, errors.New("[READ ERROR] concurrent ReadPacket — one-reader invariant violated")
+	}
+	defer s.readerOwner.Store(0)
 
 	conn := s.getConn()
 	if conn == nil {
@@ -281,7 +297,7 @@ func (s *Session) ReadPacket() (*Packet, error) {
 		return nil, errors.New("packet too short, missing message type byte")
 	}
 
-	return &Packet{
+	return &PacketFrame{
 		PacketLength:  pktLen,
 		PaddingLength: padLen,
 		Payload:       payload,
@@ -291,7 +307,26 @@ func (s *Session) ReadPacket() (*Packet, error) {
 }
 
 // WritePacket frames the payload, encrypts it, and sends it over the TCP socket.
-func (s *Session) WritePacket(msgType uint8, data []byte) error {
+func (s *Session) WritePacket(msgType uint8, packet Packet) error {
+
+	if packet == nil {
+		return s.WritePacketRaw(msgType, nil)
+	}
+
+	if p, ok := packet.(*Channel); ok {
+		if msgType == MsgServerChanneledData {
+			return s.SendChannelData(MsgServerChanneledData, p.ChannelID, p.Data)
+		}
+
+		if msgType == MsgClientChanneledData {
+			return s.SendChannelData(MsgClientChanneledData, p.ChannelID, p.Data)
+		}
+	}
+
+	return s.WritePacketRaw(msgType, packet.Marshal())
+}
+
+func (s *Session) WritePacketRaw(msgType uint8, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -427,7 +462,7 @@ func (s *Session) IncrementClientChannelID() uint32 {
 	return s.channelCounter.Add(1) | ClientChannelIDBit
 }
 
-func (s *Session) AddActiveChannel(id uint32, conn io.ReadWriteCloser) {
+func (s *Session) addActiveChannel(id uint32, conn io.ReadWriteCloser) {
 	s.activeChannelsMu.Lock()
 	defer s.activeChannelsMu.Unlock()
 	if s.activeChannels == nil {
@@ -456,45 +491,23 @@ func (s *Session) GetActiveChannel(id uint32) (io.ReadWriteCloser, bool) {
 	return conn, exists
 }
 
+/*
 func (s *Session) WaitForClientChannelOpenConfirmed(id uint32) bool {
 
-	pkt, err := s.ReadPacket()
-	if err != nil {
-		log.Printf("[Error] Failed to read packet while waiting for channel confirmation: %v", err)
-		return false
-	}
+		s.ConfirmChannelsMu.Lock()
+		defer s.ConfirmChannelsMu.Unlock()
 
-	if pkt.Payload[0] != MsgClientChannelOpenConfirm {
-		log.Printf("[Error] Expected MsgClientChannelOpenConfirm but got: %d", pkt.Payload[0])
-		return false
-	}
-	confirm, err := ParseClientChannelOpenConfirm(pkt.Payload[1:])
-
-	if err != nil {
-		log.Printf("Malformed Channel Open Confirmation from client")
-		return false
-	}
-
-	if confirm.ChannelID != id {
-		log.Printf("[Error] Channel ID mismatch: expected %d, got %d", id, confirm.ChannelID)
-		return false
-	}
-
-	s.ConfirmChannelsMu.Lock()
-	defer s.ConfirmChannelsMu.Unlock()
-	if confirm.Success {
 		if s.channelOpenConfirmed == nil {
-			s.channelOpenConfirmed = make(map[uint32]bool)
+			s.channelOpenConfirmed = make(map[uint32]chan bool)
+
+			s.channelOpenConfirmed[id] = true
+			return true
 		}
 
-		s.channelOpenConfirmed[id] = true
-		return true
+		return false
 	}
-
-	return false
-}
-
-func (s *Session) AddActiveChannelWithConfirmation(id uint32, conn io.ReadWriteCloser) {
+*/
+func (s *Session) addActiveChannelWithConfirmation(id uint32, conn io.ReadWriteCloser) bool {
 	s.activeChannelsMu.Lock()
 	if s.activeChannels == nil {
 		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
@@ -504,16 +517,33 @@ func (s *Session) AddActiveChannelWithConfirmation(id uint32, conn io.ReadWriteC
 
 	s.ConfirmChannelsMu.Lock()
 	if s.channelOpenConfirmed == nil {
-		s.channelOpenConfirmed = make(map[uint32]bool)
+		s.channelOpenConfirmed = make(map[uint32]chan bool, 1)
 	}
-	s.channelOpenConfirmed[id] = false
+	s.channelOpenConfirmed[id] = make(chan bool, 1)
 	s.ConfirmChannelsMu.Unlock()
+
+	//wait for confirmation or time out
+	select {
+	case open := <-s.channelOpenConfirmed[id]:
+		if open {
+			log.Printf("client confirmed channel opne ID: %d", id)
+		} else {
+			log.Printf("client couldnt open channel ID: %d", id)
+		}
+
+		return open
+	case <-time.After(MAX_WAIT_FOR_CHAN_CONFIRM):
+		log.Printf("channel Confirmation Timeout,  ID : %d\n", id)
+		return false
+	}
+
 }
 
 func (s *Session) DeleteActiveChannel(id uint32) {
 	s.activeChannelsMu.Lock()
-	defer s.activeChannelsMu.Unlock()
 	delete(s.activeChannels, id)
+	s.activeChannelsMu.Unlock()
+	s.closeFlow(id) // wake any blocked sender; drop credit state
 }
 
 func (s *Session) AttachNewSocket(newConn net.Conn) {
@@ -530,6 +560,11 @@ func (s *Session) AttachNewSocket(newConn net.Conn) {
 	// Attach the fresh, newly resumed socket
 	s.conn = newConn
 }
+func (s *Session) closeConn() {
+	if c := s.getConn(); c != nil {
+		c.Close()
+	}
+}
 
 // getConn is a thread-safe helper to grab the current active socket.
 func (s *Session) getConn() net.Conn {
@@ -538,60 +573,73 @@ func (s *Session) getConn() net.Conn {
 	return s.conn
 }
 
-func (s *Session) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Close the channel exactly once, no matter how many times Close() is called
-	s.closeOnce.Do(func() {
-		close(s.Closed)
-	})
-
-	for _, ch := range s.activeChannels {
-		ch.Close() // forcefully closes all active channels on the session
-	}
-	log.Printf("[Log] user [%s] Session closed: %x\r\n", s.User, s.ID)
-	return s.conn.Close()
-}
-
 func (s *Session) CloseWithSignal(timeout time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	msgType := uint8(MsgClientSessionClosed)
+	if s.isDaemon {
+		msgType = MsgServerSessionClosed
+	}
 
-	errCh := make(chan error)
-
+	errCh := make(chan error, 1)
 	go func() {
-		if s.isDaemon {
-			errCh <- s.WritePacket(MsgServerSessionClosed, nil)
-		} else {
-			errCh <- s.WritePacket(MsgClientSessionClosed, nil)
-		}
-
+		errCh <- s.WritePacket(msgType, nil)
 	}()
 
 	select {
 	case err := <-errCh:
 		if err != nil {
 			if s.isDaemon {
-				log.Printf("[Log] Failed to Send Session Close Msg to Server: %v\r\n", err)
+				log.Printf("[Log] Failed to send session-close signal to client: %v\r\n", err)
 			} else {
-				log.Printf("[Log] Failed to Send Session Close Msg to Client: %v\r\n", err)
+				log.Printf("[Log] Failed to send session-close signal to server: %v\r\n", err)
 			}
 		}
-
 	case <-time.After(timeout):
+		log.Printf("[Log] Session-close signal timed out after %s\r\n", timeout)
 	}
 
-	close(errCh)
+	log.Printf("[Log] user [%s] Session closing gracefully, sent close signal: %x\r\n", s.User, s.ID)
+	return s.shutdown()
+}
 
-	// Close the channel exactly once
+func (s *Session) Close() error { return s.shutdown() }
+
+func (s *Session) shutdown() error {
+	var closeErr error
 	s.closeOnce.Do(func() {
 		close(s.Closed)
-	})
+		s.closeAllChannels()
+		s.mu.Lock()
+		conn := s.conn
+		s.mu.Unlock()
 
+		if s.User == "" {
+			log.Printf("[Log] Session [%x] closed With No User\r\n", s.ID[:10])
+		} else {
+			log.Printf("[Log] user [%s] Session [%x] closed \r\n", s.User, s.ID)
+		}
+
+		if conn != nil {
+			closeErr = conn.Close()
+		}
+	})
+	return closeErr
+}
+
+func (s *Session) SetDeadline(t time.Time) error {
+	return s.conn.SetDeadline(t)
+}
+
+func (s *Session) closeAllChannels() {
+	s.activeChannelsMu.Lock()
+	chans := make([]io.ReadWriteCloser, 0, len(s.activeChannels))
 	for _, ch := range s.activeChannels {
-		ch.Close() // forcefully closes all active channels on the session
+		chans = append(chans, ch)
 	}
-	log.Printf("[Log] user [%s] Session closed gracefully, sent close signal to the other side: %x\r\n", s.User, s.ID)
-	return s.conn.Close() //close the underlying TCP connection
+	s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+	s.activeChannelsMu.Unlock()
+
+	for _, ch := range chans {
+		ch.Close()
+	}
+	s.closeAllFlows()
 }

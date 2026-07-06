@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/mattn/go-sqlite3 v1.14.47
+	//github.com/mattn/go-sqlite3 v1.14.47
 	github.com/msteinert/pam v1.2.0
 	github.com/the-mhdi/wireforge v1.0.0
 	golang.org/x/crypto v0.53.0
