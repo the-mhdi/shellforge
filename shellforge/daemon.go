@@ -741,7 +741,7 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				continue
 			}
 
-			log.Printf("Data received on Channel %d", ch.ChannelID)
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
 				if p, ok := c.(*PipeStream); ok {
@@ -920,7 +920,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				continue
 			}
 
-			log.Printf("Data received on Channel %d", ch.ChannelID)
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
 				if p, ok := c.(*PipeStream); ok {
