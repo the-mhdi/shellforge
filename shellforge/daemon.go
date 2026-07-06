@@ -640,8 +640,6 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				return
 			}
 
-			defer session.WritePacket(MsgServerChannelClosed, co)
-
 			//client needs to send MsgClientChannelOpenConfirm
 			/*if !session.WaitForClientChannelOpenConfirmed(chanID) {
 				return
@@ -656,6 +654,7 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 					return
 				}
 				defer session.closeChannel(chanID)
+				defer session.WritePacket(MsgServerChannelClosed, co)
 				err = d.GetContainerLogs(ctx, env.Name, pipeStream)
 
 				if err != nil {
@@ -710,7 +709,6 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				ChannelID: chanID,
 			}
 			session.WritePacket(MsgServerOpenReadChannel, co)
-			defer session.WritePacket(MsgServerChannelClosed, co)
 
 			//client needs to send MsgClientChannelOpenConfirm
 			//	if !session.WaitForClientChannelOpenConfirmed(chanID) {
@@ -726,6 +724,7 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				}
 
 				defer session.closeChannel(chanID)
+				defer session.WritePacket(MsgServerChannelClosed, co)
 				command := string(cop.Command)
 				err = d.ContainerExec(ctx, env.Name, command, pipeStream)
 				if err != nil {
