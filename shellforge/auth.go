@@ -49,10 +49,10 @@ func ParsePubAuthRequest(data []byte) (*PubAuthRequest, error) {
 	ar.Username = string(data[offset : offset+int(ar.UserLen)])
 	offset += int(ar.UserLen)
 
-	ar.PublicKey = data[offset : offset+32]
+	ar.PublicKey = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf (stored on session)
 	offset += 32
 
-	ar.Signature = data[offset : offset+64]
+	ar.Signature = cloneBytes(data[offset : offset+64]) // copy: detach from reused rdBuf
 
 	return ar, nil
 }
@@ -173,7 +173,7 @@ func ParsePKIAuthRequest(data []byte) (*PKIAuthRequest, error) {
 	if len(data) < offset+int(req.CertLen) {
 		return nil, ErrMalformedPKIPacket
 	}
-	req.Certificate = data[offset : offset+int(req.CertLen)]
+	req.Certificate = cloneBytes(data[offset : offset+int(req.CertLen)]) // copy: detach from reused rdBuf
 	offset += int(req.CertLen)
 
 	// 3. Read SigLen (2 bytes)
@@ -187,7 +187,7 @@ func ParsePKIAuthRequest(data []byte) (*PKIAuthRequest, error) {
 	if len(data) < offset+int(req.SigLen) {
 		return nil, ErrMalformedPKIPacket
 	}
-	req.Signature = data[offset : offset+int(req.SigLen)]
+	req.Signature = cloneBytes(data[offset : offset+int(req.SigLen)]) // copy: detach from reused rdBuf
 
 	return req, nil
 }

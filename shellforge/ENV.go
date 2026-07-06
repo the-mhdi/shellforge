@@ -57,10 +57,10 @@ func ParseENVRequest(data []byte) (*EnvRequest, error) {
 	ts.RequestID = binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
-	ts.PublicKey = data[offset : offset+32]
+	ts.PublicKey = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf
 	offset += 32
 
-	ts.Signature = data[offset : offset+64]
+	ts.Signature = cloneBytes(data[offset : offset+64]) // copy: detach from reused rdBuf
 	offset += 64
 
 	ts.AccessTypeLen = binary.BigEndian.Uint16(data[offset : offset+2])
@@ -70,7 +70,7 @@ func ParseENVRequest(data []byte) (*EnvRequest, error) {
 	if len(data) < offset+int(ts.AccessTypeLen)+1 {
 		return nil, ErrCanNotParseMalformedPacket
 	}
-	ts.AccessType = data[offset : offset+int(ts.AccessTypeLen)] // Zero-Copy conversion
+	ts.AccessType = cloneBytes(data[offset : offset+int(ts.AccessTypeLen)]) // copy: detach from reused rdBuf
 	offset += int(ts.AccessTypeLen)
 
 	// 3. Read UserRequestedNameLen (1 byte)
@@ -81,7 +81,7 @@ func ParseENVRequest(data []byte) (*EnvRequest, error) {
 	if len(data) < offset+int(ts.UserRequestedNameLen) {
 		return nil, ErrCanNotParseMalformedPacket
 	}
-	ts.UserRequestedName = data[offset : offset+int(ts.UserRequestedNameLen)] // Zero-Copy conversion
+	ts.UserRequestedName = cloneBytes(data[offset : offset+int(ts.UserRequestedNameLen)]) // copy: detach from reused rdBuf
 
 	return ts, nil
 }
@@ -161,7 +161,7 @@ func ParseEnvCreated(data []byte) (*EnvCreated, error) {
 	ec.RequestID = binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
-	ec.PublicKey = data[offset : offset+32]
+	ec.PublicKey = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf
 	offset += 32
 
 	ec.AccessTypeLen = binary.BigEndian.Uint16(data[offset : offset+2])
@@ -171,7 +171,7 @@ func ParseEnvCreated(data []byte) (*EnvCreated, error) {
 	if len(data) < offset+int(ec.AccessTypeLen)+1 {
 		return nil, ErrMalformedControlPacket
 	}
-	ec.AccessType = data[offset : offset+int(ec.AccessTypeLen)] // Zero-Copy!
+	ec.AccessType = cloneBytes(data[offset : offset+int(ec.AccessTypeLen)]) // copy: detach from reused rdBuf
 	offset += int(ec.AccessTypeLen)
 
 	// Read UserRequestedNameLen (1 byte)
@@ -182,7 +182,7 @@ func ParseEnvCreated(data []byte) (*EnvCreated, error) {
 	if len(data) < offset+int(ec.UserRequestedNameLen)+1 {
 		return nil, ErrMalformedControlPacket
 	}
-	ec.UserRequestedName = data[offset : offset+int(ec.UserRequestedNameLen)] // Zero-Copy!
+	ec.UserRequestedName = cloneBytes(data[offset : offset+int(ec.UserRequestedNameLen)]) // copy: detach from reused rdBuf
 	offset += int(ec.UserRequestedNameLen)
 
 	// Read NameLen (1 byte)
@@ -193,7 +193,7 @@ func ParseEnvCreated(data []byte) (*EnvCreated, error) {
 	if len(data) < offset+int(ec.NameLen)+1 {
 		return nil, ErrMalformedControlPacket
 	}
-	ec.Name = data[offset : offset+int(ec.NameLen)] // Zero-Copy!
+	ec.Name = cloneBytes(data[offset : offset+int(ec.NameLen)]) // copy: detach from reused rdBuf
 	offset += int(ec.NameLen)
 
 	// 5. Read Success flag (1 byte: 0x01 = true, 0x00 = false)

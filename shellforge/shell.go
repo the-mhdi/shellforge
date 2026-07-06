@@ -197,7 +197,7 @@ func ParseShellRequest(data []byte) (*ShellRequest, error) {
 	if len(data) < offset+int(sr.UsernameLen) {
 		return nil, ErrMalformedControlPacket
 	}
-	sr.User = data[offset : offset+int(sr.UsernameLen)]
+	sr.User = cloneBytes(data[offset : offset+int(sr.UsernameLen)]) // copy: detach from reused rdBuf
 	offset += int(sr.UsernameLen)
 
 	// 3. Bounds check: ShellLen (2)
@@ -211,7 +211,7 @@ func ParseShellRequest(data []byte) (*ShellRequest, error) {
 	if len(data) < offset+int(sr.ShellLen) {
 		return nil, ErrMalformedControlPacket
 	}
-	sr.Shell = data[offset : offset+int(sr.ShellLen)]
+	sr.Shell = cloneBytes(data[offset : offset+int(sr.ShellLen)]) // copy: detach from reused rdBuf
 	offset += int(sr.ShellLen)
 
 	// 5. Bounds check: Row (2) + Cols (2) = 4 bytes

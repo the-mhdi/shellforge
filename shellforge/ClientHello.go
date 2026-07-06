@@ -87,7 +87,7 @@ func parseClientHello(data []byte) (*ClientHello, error) {
 	if len(data) < offset+int(h.SessLen) {
 		return nil, ErrMalformedPacket
 	}
-	h.SessionID = data[offset : offset+int(h.SessLen)]
+	h.SessionID = cloneBytes(data[offset : offset+int(h.SessLen)]) // copy: detach from reused rdBuf
 	offset += int(h.SessLen)
 
 	// 3. Read EncryptionSupport (1 byte)
@@ -111,7 +111,7 @@ func parseClientHello(data []byte) (*ClientHello, error) {
 		if len(data) < offset+int(h.Encryption.ClientSharekeyLen) {
 			return nil, ErrMalformedPacket
 		}
-		h.Encryption.Client_Share_key = data[offset : offset+int(h.Encryption.ClientSharekeyLen)]
+		h.Encryption.Client_Share_key = cloneBytes(data[offset : offset+int(h.Encryption.ClientSharekeyLen)]) // copy: detach from reused rdBuf
 		offset += int(h.Encryption.ClientSharekeyLen)
 	}
 
@@ -141,7 +141,7 @@ func parseClientHello(data []byte) (*ClientHello, error) {
 			if len(data) < offset+int(currentHeader.KeyLen) {
 				return nil, ErrMalformedPacket
 			}
-			currentHeader.Key = data[offset : offset+int(currentHeader.KeyLen)]
+			currentHeader.Key = cloneBytes(data[offset : offset+int(currentHeader.KeyLen)]) // copy: detach from reused rdBuf
 			offset += int(currentHeader.KeyLen)
 			headOffset += uint32(currentHeader.KeyLen)
 
@@ -157,7 +157,7 @@ func parseClientHello(data []byte) (*ClientHello, error) {
 			if len(data) < offset+int(currentHeader.ValueLen) {
 				return nil, ErrMalformedPacket
 			}
-			currentHeader.Value = data[offset : offset+int(currentHeader.ValueLen)]
+			currentHeader.Value = cloneBytes(data[offset : offset+int(currentHeader.ValueLen)]) // copy: detach from reused rdBuf
 			offset += int(currentHeader.ValueLen)
 			headOffset += uint32(currentHeader.ValueLen)
 
@@ -174,7 +174,7 @@ func parseClientHello(data []byte) (*ClientHello, error) {
 	if len(data) < offset+32 {
 		return nil, ErrMalformedPacket
 	}
-	h.ClientRandom = data[offset : offset+32]
+	h.ClientRandom = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf
 	offset += 32
 
 	return h, nil
@@ -318,7 +318,7 @@ func ParseResumeProof(data []byte) (*ResumeProof, error) {
 	}
 
 	return &ResumeProof{
-		ClientRandom: data[:32], // Zero-Copy!
+		ClientRandom: cloneBytes(data[:32]), // copy: detach from reused rdBuf
 	}, nil
 }
 

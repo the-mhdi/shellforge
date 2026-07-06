@@ -741,7 +741,7 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				continue
 			}
 
-			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			//	log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
 				if p, ok := c.(*PipeStream); ok {
@@ -920,7 +920,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				continue
 			}
 
-			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
 				if p, ok := c.(*PipeStream); ok {
@@ -942,11 +942,11 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 		case MsgClientShellRequest:
 			// 1. Parse the specific shell request
 			sr, err := ParseShellRequest(pkt.Payload[1:])
-			log.Printf("Received Shell Request for user [%s] and shell [%s]- Req id %v", string(sr.User), string(sr.Shell), sr.RequestID)
 			if err != nil {
 				session.WritePacket(MsgServerFailedToOpenShell, nil)
 				continue
 			}
+			log.Printf("Received Shell Request for user [%s] and shell [%s]- Req id %v", string(sr.User), string(sr.Shell), sr.RequestID)
 
 			// 2. Daemon is authoritative! It assigns the Channel ID safely.
 			chanID := session.IncrementChannelID()
@@ -1004,8 +1004,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				log.Printf("interactive shell running in the background, ChanID %d", chanID)
 				// Spawn the PTY
 
-				err = RunInteractiveShell(ctx, shellrq, pipeStream, shellrq.Row, shellrq.Cols)
-				if err != nil {
+				if err := RunInteractiveShell(ctx, shellrq, pipeStream, shellrq.Row, shellrq.Cols); err != nil {
 					log.Printf(" interactive shell failed: %v", err)
 				}
 			}(shell, pipeStream)

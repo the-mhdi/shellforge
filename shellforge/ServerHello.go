@@ -86,7 +86,7 @@ func ParseServerHello(data []byte) (*ServerHello, error) {
 	if len(data) < offset+int(sh.SessLen) {
 		return nil, ErrMalformedServerHello
 	}
-	sh.SessionID = data[offset : offset+int(sh.SessLen)]
+	sh.SessionID = cloneBytes(data[offset : offset+int(sh.SessLen)]) // copy: detach from reused rdBuf
 	offset += int(sh.SessLen)
 
 	// 4. Read EncryptionSupport flag (1 byte)
@@ -107,7 +107,7 @@ func ParseServerHello(data []byte) (*ServerHello, error) {
 		if len(data) < offset+int(sh.Encryption.ServerSharekeyLen) {
 			return nil, ErrMalformedServerHello
 		}
-		sh.Encryption.Server_Share_key = data[offset : offset+int(sh.Encryption.ServerSharekeyLen)]
+		sh.Encryption.Server_Share_key = cloneBytes(data[offset : offset+int(sh.Encryption.ServerSharekeyLen)]) // copy: detach from reused rdBuf
 		offset += int(sh.Encryption.ServerSharekeyLen)
 	}
 
@@ -143,7 +143,7 @@ func ParseServerHello(data []byte) (*ServerHello, error) {
 			if len(data) < offset+int(currentHeader.KeyLen) {
 				return nil, ErrMalformedServerHello
 			}
-			currentHeader.Key = data[offset : offset+int(currentHeader.KeyLen)]
+			currentHeader.Key = cloneBytes(data[offset : offset+int(currentHeader.KeyLen)]) // copy: detach from reused rdBuf
 			offset += int(currentHeader.KeyLen)
 			headOffset += uint32(currentHeader.KeyLen)
 
@@ -159,7 +159,7 @@ func ParseServerHello(data []byte) (*ServerHello, error) {
 			if len(data) < offset+int(currentHeader.ValueLen) {
 				return nil, ErrMalformedServerHello
 			}
-			currentHeader.Value = data[offset : offset+int(currentHeader.ValueLen)]
+			currentHeader.Value = cloneBytes(data[offset : offset+int(currentHeader.ValueLen)]) // copy: detach from reused rdBuf
 			offset += int(currentHeader.ValueLen)
 			headOffset += uint32(currentHeader.ValueLen)
 

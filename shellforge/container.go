@@ -94,7 +94,7 @@ func ParseContainersListResponse(data []byte) (*ContainersListResponse, error) {
 	res.RequestID = binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
-	res.PublicKey = data[offset : offset+32]
+	res.PublicKey = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf
 	offset += 32
 
 	count := binary.BigEndian.Uint16(data[offset : offset+2])
@@ -337,7 +337,7 @@ func ParseContainerOpRequest(data []byte) (*ContainerOpRequest, error) {
 	cr.RequestID = binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
-	cr.PublicKey = data[offset : offset+32]
+	cr.PublicKey = cloneBytes(data[offset : offset+32]) // copy: detach from reused rdBuf
 	offset += 32
 
 	cr.NameLen = data[offset]
@@ -347,7 +347,7 @@ func ParseContainerOpRequest(data []byte) (*ContainerOpRequest, error) {
 	if len(data) < offset+int(cr.NameLen) {
 		return nil, ErrMalformedContainerOpRequest
 	}
-	cr.Name = data[offset : offset+int(cr.NameLen)] // Zero-Copy conversion
+	cr.Name = cloneBytes(data[offset : offset+int(cr.NameLen)]) // copy: detach from reused rdBuf
 	offset += int(cr.NameLen)
 
 	// 3. Read OpType (1 byte)
@@ -368,7 +368,7 @@ func ParseContainerOpRequest(data []byte) (*ContainerOpRequest, error) {
 		if len(data) < offset+int(cr.CommandLen) {
 			return nil, ErrMalformedContainerOpRequest
 		}
-		cr.Command = data[offset : offset+int(cr.CommandLen)]
+		cr.Command = cloneBytes(data[offset : offset+int(cr.CommandLen)]) // copy: detach from reused rdBuf
 		offset += int(cr.CommandLen)
 	}
 

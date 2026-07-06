@@ -28,12 +28,12 @@ func (m *Message) Unmarshal(data []byte) error {
 		return ErrMalformedControlPacket
 	}
 
-	m.Key = data[offset : offset+int(m.KLen)] // Zero-Copy conversion [3]
+	m.Key = cloneBytes(data[offset : offset+int(m.KLen)]) // copy: detach from reused rdBuf
 	offset += int(m.KLen)
 
 	// 3. The Value is simply everything remaining in the packet [1]
 	// No bounds check is required here because we already verified offset <= len(data).
-	m.Value = data[offset:] // Zero-Copy conversion [3]
+	m.Value = cloneBytes(data[offset:]) // copy: detach from reused rdBuf
 
 	return nil
 }
