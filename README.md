@@ -32,9 +32,9 @@ flowchart LR
         SB["Sandbox<br/>cgroups · netns"]
     end
 
+    C3 --> M
     C1 --> M
     C2 --> M
-    C3 --> M
     M --> D1
     M --> D2
     M --> D3
