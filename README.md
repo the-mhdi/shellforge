@@ -428,5 +428,9 @@ Known limitations currently include:
 - [`urfave/cli`](https://github.com/urfave/cli) — command-line interface
 - `the-mhdi/wireforge` — TCP transport helpers
 ​
+## License
 
+ShellForge is licensed under the Apache License 2.0.
+
+ShellForge is experimental security-sensitive software. The license permits use, modification, and distribution, but the project is provided without warranty and has not been externally audited.
 ---
