@@ -100,9 +100,11 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 	dOpts := &tcp.DialOptions{
 		Verbose:              true,
 		KeepAlive:            true,
+		Timeout:              30 * time.Second,
 		KeepAliveFirstProbe:  10 * time.Second,
 		KeepAliveInterval:    10 * time.Second,
 		MaxKeepAliveAttempts: 6,
+		NoDelay:              true,
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -969,9 +971,9 @@ func (c *Client) eventLoop() {
 				continue
 			}
 
-			c.mu.RLock()
+			c.session.forwardMu.RLock()
 			localTarget, exists := c.session.forwardMap[sco.RemoteAddr]
-			c.mu.RUnlock()
+			c.session.forwardMu.RUnlock()
 
 			if !exists {
 				log.Printf("Security alert: Daemon requested unknown port %s", sco.RemoteAddr)
@@ -1022,7 +1024,10 @@ func (c *Client) eventLoop() {
 			}
 			c.mu.Unlock()
 		case MsgServerChannelUnknownOrClosed:
-			c.session.closeConn()
+			if id, err := ParseChannelClosed(pkt.Payload[1:]); err == nil {
+				c.session.closeChannel(id.ChannelID)
+			}
+
 		case MsgServerAuthSuccess:
 
 			log.Println("[Success] Logged in successfully!")
@@ -1033,19 +1038,18 @@ func (c *Client) eventLoop() {
 				continue
 			}
 			if !ec.Success {
-				log.Printf(" EnvCreate not successful")
+				log.Printf(" [EnvCreate] not successful")
 				continue
 			}
-			log.Printf(" EnvCreated : %v", err)
 			fmt.Printf(
-				"EnvCreated{\n"+
+				"\n\nEnvCreated{\n"+
 					"  RequestID: %d\n"+
 					"  PublicKey: %x\n"+
 					"  AccessType: %s\n"+
 					"  UserRequestedName: %s\n"+
 					"  Name: %s\n"+
 					"  Success: %v\n"+
-					"}\n",
+					"}\n\n",
 				ec.RequestID,
 				ec.PublicKey,
 				string(ec.AccessType),

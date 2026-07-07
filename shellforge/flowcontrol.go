@@ -44,14 +44,12 @@ var ErrFlowControlWindowOverflow = errors.New(
 // implicit and symmetric. The invariant "advertised recv window == ring
 // capacity" is exactly what lets PipeStream.Feed become non-blocking: a
 // compliant sender can never put more bytes in flight than the ring can hold.
-const INITIAL_WINDOW uint32 = PIPE_RING_CAPACITY
 
 // WINDOW_ADJUST_THRESHOLD batches credit returns. Emitting one WindowAdjust per
 // Read would flood the link with tiny control frames, so the receiver instead
 // accumulates drained bytes and only sends a WindowAdjust once at least this
 // many bytes are reclaimable. Half the window keeps the sender's pipe full
 // while roughly halving control-frame volume.
-const WINDOW_ADJUST_THRESHOLD uint32 = INITIAL_WINDOW / 2
 
 // -----------------------------------------------------------------------------
 // WindowAdjust wire message
@@ -274,7 +272,6 @@ func (s *Session) AttachChannel(id uint32, pipe io.ReadWriteCloser, closeAfterRe
 		_, _ = io.Copy(pipe, p) // p.Read drains the ring and returns credits
 		if closeAfterRead {
 			if c, ok := pipe.(io.Closer); ok {
-				log.Println("fire")
 				_ = c.Close()
 			}
 		}

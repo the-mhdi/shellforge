@@ -9,8 +9,6 @@ import (
 	"github.com/creack/pty"
 )
 
-const PIPE_RING_CAPACITY = 256 * 1024 //256kb
-
 // pipe or Channel represents a single multiplexed stream inside our secure session.
 // It implements io.ReadWritecloser.
 type PipeStream struct {

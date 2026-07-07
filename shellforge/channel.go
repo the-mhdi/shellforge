@@ -309,7 +309,7 @@ func (p *ChannelOpen) Unmarshal(data []byte) error {
 	return nil
 }
 func (p *ChannelOpen) Type() uint8 {
-	return MsgChannelClosed
+	return MsgServerOpenChannel
 }
 
 func ParseChannelOpen(data []byte) (*ChannelOpen, error) {

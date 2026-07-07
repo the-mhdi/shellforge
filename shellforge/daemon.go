@@ -194,11 +194,12 @@ func (d *Daemon) listen() {
 		// PHASE 2: CLIENT HELLO (unEncrypted)
 		// ==========================================
 		cHelloPkt, err := session.ReadPacket()
-		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Println(err)
 			return
 		}
+
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 
 		if cHelloPkt.Payload[0] != MsgClientHello {
 			session.WritePacket(MsgServerExpectedClientHello, nil)
@@ -247,11 +248,12 @@ func (d *Daemon) listen() {
 		// PHASE 3.5: authenticate access//shell
 		// ==========================================
 		pkt, err := session.ReadPacket()
-		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Printf("%v", err)
 			return
 		}
+
+		session.SetDeadline(time.Now().Add(SESSION_HANDSHAKE_DEADLINE_DEDAULT))
 
 		switch pkt.Payload[0] {
 
@@ -429,7 +431,36 @@ func (d *Daemon) listen() {
 		}
 
 	}
-	opts := tcp.DefaultListenOptions().WithVerbose(true)
+
+	opts := &tcp.ListenOptions{
+		Verbose: true,
+
+		ReuseAddr:           true,
+		ReusePort:           false,
+		TCPFastOpen:         false,
+		MultipathTCP:        true,
+		OnConnect:           nil,
+		OnConnectTimeout:    0,
+		OnDisconnect:        nil,
+		OnDisconnectTimeout: 0,
+		ShutdownTimeout:     5 * time.Second,
+
+		Inbounds: tcp.InboundConnOptions{
+			NoDelay:                true,
+			WriteBuffer:            0,
+			ReadBuffer:             0,
+			Deadline:               0,
+			DrainConnectionOnClose: 0,
+
+			KeepAlive: true,
+
+			KeepAliveFirstProbe:  0,
+			KeepAliveInterval:    0,
+			MaxKeepAliveAttempts: 0,
+		},
+	}
+	//opts := tcp.DefaultListenOptions().WithVerbose(true)
+
 	var address string
 
 	if d.Conf.ListenAddr == "" && d.Conf.Port == "" {
@@ -527,12 +558,13 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 
 		pkt, err := session.ReadPacket()
 		//log.Printf("pkt %x...", session.ID[0:3])
-		session.SetDeadline(time.Now().Add(SESSION_DEADLINE_DEDAULT))
 		if err != nil {
 			log.Printf("[] Error reading packet from Session %x...: %v", session.ID[0:3], err)
 			log.Printf("Ending The Session %x... : %v", session.ID[0:3], err)
 			break
 		}
+
+		session.SetDeadline(time.Now().Add(SESSION_DEADLINE_DEDAULT))
 
 		switch pkt.Payload[0] {
 		case MsgClientGetContainerShell:
@@ -919,7 +951,7 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 				continue
 			}
 
-			log.Printf("Data received on Channel %d", ch.ChannelID)
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
 				if p, ok := c.(*PipeStream); ok {

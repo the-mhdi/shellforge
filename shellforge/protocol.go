@@ -16,14 +16,27 @@ import (
 
 var ErrCanNotParseMalformedPacket = errors.New("ErrCanNotParseMalformedPacket")
 
+const MAX_PACKET_LEN uint32 = 256 * 1024 //defu 64kb
+const MIN_PACKET_LEN uint32 = 4          // Minimum packet size to prevent abuse (e.g., empty packets)
+const MAX_AUTH_RETRY uint8 = 5
+
+const CLEANUP_INTERVAL time.Duration = 5 * time.Minute
+
+// PIPE_BUFFER_SIZE uint32        = (4 * 1024) //4kb
+
 // We partition the 32-bit ID space using the top bit, and both peers agree on
 // the full 32-bit ID (namespace bit included) on the wire:
 //   - server-initiated IDs: high bit CLEAR (0x0000_0001 .. 0x7FFF_FFFF)
 //   - client-initiated IDs: high bit SET   (0x8000_0001 .. 0xFFFF_FFFF)
 const ClientChannelIDBit uint32 = 1 << 31
+
 const MAX_WAIT_FOR_CHAN_CONFIRM = 5 * time.Second
 const SESSION_DEADLINE_DEDAULT = 15 * time.Minute
 const SESSION_HANDSHAKE_DEADLINE_DEDAULT = 1 * time.Minute
+
+const PIPE_RING_CAPACITY = 2 * 1024 * 1024 // 2 MB
+const INITIAL_WINDOW uint32 = PIPE_RING_CAPACITY
+const WINDOW_ADJUST_THRESHOLD uint32 = INITIAL_WINDOW / 8
 
 const (
 	AuthMethodPassword  uint8 = 0x01 // 1 << 0 (0000 0001) - Password/PAM
@@ -40,14 +53,6 @@ const (
 	//supported Key Exchange (KEX) Algorithms
 	KexX25519               uint16 = 0x1000
 	KexHybridX25519MLKEM768 uint16 = 0x2000
-)
-
-const (
-	MAX_PACKET_LEN uint32 = 64 * 1024 //defu 64kb
-	MIN_PACKET_LEN uint32 = 4         // Minimum packet size to prevent abuse (e.g., empty packets)
-	MAX_AUTH_RETRY uint8  = 5
-	//PIPE_BUFFER_SIZE uint32        = (4 * 1024) //4kb
-	CLEANUP_INTERVAL time.Duration = 5 * time.Minute
 )
 
 // Message Types
@@ -131,7 +136,7 @@ const (
 
 	MsgChanIDRenegotiationRequest uint8 = 46
 
-	MsgserverUnsupportedKexCipher = 111
+	MsgserverUnsupportedKexCipher = 123
 
 	MsgClientSessionClosed uint8 = 249
 	MsgServerSessionClosed uint8 = 250
