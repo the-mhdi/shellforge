@@ -56,13 +56,31 @@ func main() {
 		os.Exit(1)
 	}
 	ctx := context.Background()
+	waiting := func() {
+		quit := make(chan os.Signal, 1)
+		// // Catch Ctrl+C (SIGINT) and Docker/K8s stop (SIGTERM)
+		signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+		select {
+		case <-quit:
+
+			log.Printf(" SIGTERM CAUGHT")
+
+		case <-ctx.Done():
+
+			log.Printf("Shutting down gracefully")
+
+		}
+	}
 	switch args[0] {
 	case "container":
 		err = runContainerMode(ctx, args[1:], configOverride)
+		waiting()
 	case "containers":
 		err = getContainers(ctx, args[1:], configOverride)
+		waiting()
 	case "make":
 		err = runMakeMode(ctx, args[1:], configOverride)
+		waiting()
 	default:
 		err = runDefaultMode(ctx, args, configOverride)
 	}
@@ -70,19 +88,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	quit := make(chan os.Signal, 1)
-	// // Catch Ctrl+C (SIGINT) and Docker/K8s stop (SIGTERM)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	select {
-	case <-quit:
 
-		log.Printf(" SIGTERM CAUGHT")
-
-	case <-ctx.Done():
-
-		log.Printf("Shutting down gracefully")
-
-	}
 }
 
 // runContainerMode now dispatches subcommands:

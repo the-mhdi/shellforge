@@ -1,6 +1,7 @@
 package shellforge
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/aes"
@@ -268,7 +269,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 			Client_Share_key:  shareKey,
 		}
 
-	} else {
+	} /*else {
 		// --- RESUMING CONNECTION ---
 		log.Printf("[Log] Resuming Client Session With ID: %x, Trying to Craft a New Client Hello Resume and RESUMPTION PROOF", c.session.ID)
 		c.mu.RLock()
@@ -278,7 +279,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 
 		cHello.EncryptionSupport = true
 
-	}
+	}*/
 
 	if err := tempSession.WritePacket(MsgClientHello, cHello); err != nil {
 		return err
@@ -289,7 +290,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 	// ==========================================
 	// PHASE 2.5: RESUMPTION PROOF (If resuming)
 	// ==========================================
-	if isResume {
+	/*if isResume {
 
 		log.Printf("[Log] Session %x Being Resumed", c.session.ID)
 
@@ -312,7 +313,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 
 		// Switch to using the established session for Phase 3
 		tempSession = c.session
-	}
+	}*/
 
 	// ==========================================
 	// PHASE 3: SERVER HELLO & VALIDATION
@@ -578,7 +579,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 	// ==========================================
 	// PHASE 2.5: RESUMPTION PROOF (If resuming)
 	// ==========================================
-	if isResume {
+	/*if isResume {
 
 		log.Printf("[Log] Session %x Being Resumed", c.session.ID)
 
@@ -602,7 +603,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 		// Switch to using the established session for Phase 3
 		tempSession = c.session
 	}
-
+	*/
 	// ==========================================
 	// PHASE 3: SERVER HELLO & VALIDATION
 	// ==========================================
@@ -956,13 +957,19 @@ func (c *Client) eventLoop() {
 			}
 			// Buffer server logs in a ring, drained to stdout with the "[Server LOG]: "
 			// prefix. false => never close os.Stdout when the channel ends.
-			c.session.AttachChannel(ch.ChannelID,
-				os.Stdout, false)
+			Channel, k := c.session.NewChannelWithID(ch.ChannelID, false)
+			if k {
+				err := Channel.AttachWriter(os.Stdin)
+				if err != nil {
+					log.Printf("[Error] failed to open log channel: %v", err)
+					continue
+				}
+			}
 			log.Printf("Server Log channel Opened, %d", ch.ChannelID)
 
 			confirm := &ClientChannelOpenConfirm{ChannelID: ch.ChannelID, Success: true}
 			c.session.WritePacket(MsgClientChannelOpenConfirm, confirm)
-			defer c.session.closeChannel(ch.ChannelID)
+			defer Channel.Close()
 
 		case MsgServerNewChannelOpened:
 			// A public web user connected to the Daemon! We must dial our local target.
@@ -985,25 +992,30 @@ func (c *Client) eventLoop() {
 
 		case MsgServerChanneledData:
 			// Data arriving from the Daemon destined for our local server or shell
-			cd, err := ParseChannelData(pkt.Payload[1:])
+			ch, err := ParseChannelData(pkt.Payload[1:])
 			if err != nil {
+				log.Println("Malformed Channel Data from client")
+				go c.session.WritePacket(MsgServerChanDataMalformed, nil)
 				continue
 			}
-			if ac, exists := c.session.GetActiveChannel(cd.ChannelID); exists {
-				if p, ok := ac.(*PipeStream); ok {
-					if _, err := p.Feed(cd.Data); err != nil {
-						log.Printf("channel %d feed failed: %v; closing", cd.ChannelID, err)
-						c.session.closeChannel(cd.ChannelID)
-						c.session.WritePacket(MsgClientChannelClosed,
-							(&ChannelClosed{ChannelID: cd.ChannelID}))
-					}
-				}
+
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			// Look up the session and ch id and write the data
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			err = c.session.Stream.Feed(pkt.Payload[1:])
+			if err != nil {
+
+				// Flow-control violation or closed pipe: drop the channel,
+				// never block the shared reader.
+				//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
+				//		session.CloseActiveChannel(ch.ChannelID)
+				c.session.WritePacket(MsgClientChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
 			}
 
 		case MsgServerChannelClosed:
 			// The remote user disconnected
 			if ccl, err := ParseChannelClosed(pkt.Payload[1:]); err == nil {
-				c.session.closeChannel(ccl.ChannelID)
+				c.session.Stream.CloseActiveChannel(ccl.ChannelID)
 			}
 
 		case MsgServerShellReqResponse:
@@ -1025,7 +1037,7 @@ func (c *Client) eventLoop() {
 			c.mu.Unlock()
 		case MsgServerChannelUnknownOrClosed:
 			if id, err := ParseChannelClosed(pkt.Payload[1:]); err == nil {
-				c.session.closeChannel(id.ChannelID)
+				c.session.Stream.CloseActiveChannel(id.ChannelID)
 			}
 
 		case MsgServerAuthSuccess:
@@ -1076,7 +1088,7 @@ func (c *Client) eventLoop() {
 
 		case MsgWindowAdjust:
 			if wa, err := ParseWindowAdjust(pkt.Payload[1:]); err == nil {
-				c.session.grantSendWindow(wa.ChannelID, wa.Increment)
+				c.session.Stream.grantSendWindow(wa.ChannelID, wa.Increment)
 			}
 
 		default:
@@ -1094,8 +1106,9 @@ func (c *Client) handleIncomingTrafiic(channelID uint32, localTarget string) {
 		return
 	}
 
-	c.session.AttachChannel(channelID, localConn, true) // inbound ring -> localConn
-	defer c.session.closeChannel(channelID)
+	channelID, Channel := c.session.NewChannel(false) // inbound ring -> localConn
+	Channel.AttachWriter(localConn)
+	defer Channel.Close()
 
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
@@ -1169,9 +1182,19 @@ func (c *Client) ForwardRemoteToLocal(remotePort string, localTarget string) err
 func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr string, remoteTarget string) error {
 
 	handler := func(ctx context.Context, localConn net.Conn) {
-		chanID := c.session.IncrementClientChannelID()
-		c.session.AttachChannel(chanID, localConn, true)
-		defer c.session.closeChannel(chanID)
+		chanID := c.session.Stream.IncrementClientChannelID()
+		Channel, ok := c.session.NewChannelWithID(chanID, false) // inbound ring -> localConn
+		if !ok {
+			log.Println("bluhhhhhhh")
+			return
+		}
+		if werr := Channel.AttachWriter(localConn); werr != nil {
+			log.Println("wwbluhhhhhhh")
+			return
+		}
+		defer Channel.Close()
+		//	c.session.AttachChannelwi(chanID, localConn, true)
+		//	defer c.session.CloseActiveChannel(chanID)
 
 		req := &ClientChannelOpen{
 			ChannelID:  chanID,
@@ -1207,14 +1230,20 @@ func (c *Client) Close() error {
 
 // RequestShell asks the daemon for an interactive shell and links os.Stdin/Stdout to it!
 // SENDS TWO PACKETS SHELL REQ + WINDOW RESIZE
+// escapeByte is the local escape key (Ctrl+]). Pressing it in a raw-mode
+// shell tears the session down locally without waiting for the daemon.
+const escapeByte = 0x1D
+
+// RequestShell asks the daemon for an interactive shell and links os.Stdin/Stdout to it.
+// SENDS TWO PACKETS: SHELL REQ + WINDOW RESIZE
 func (c *Client) RequestShell(shellPath, username string) error {
 	// 1. Generate a random RequestID (4 bytes for Uint32)
 	reqID := binary.BigEndian.Uint32(randomBytes(4))
-	// Get the file descriptor for Stdin
-	cols, row, err := term.GetSize(int(os.Stdin.Fd()))
+
+	cols, rows, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
 		log.Printf("failed to get initial window size")
-		cols, row = 80, 24 // Default size
+		cols, rows = 80, 24 // Default size
 	}
 
 	req := &ShellRequest{
@@ -1223,7 +1252,7 @@ func (c *Client) RequestShell(shellPath, username string) error {
 		User:        []byte(username),
 		ShellLen:    uint16(len(shellPath)),
 		Shell:       []byte(shellPath),
-		Row:         uint16(row), // Default size, will be updated by the client later
+		Row:         uint16(rows),
 		Cols:        uint16(cols),
 	}
 
@@ -1240,78 +1269,79 @@ func (c *Client) RequestShell(shellPath, username string) error {
 		c.mu.Unlock()
 		return err
 	}
-
 	log.Printf("Requested shell (%s). Waiting for Server approval...", shellPath)
 
 	// ========================================================
 	// SET UP SYSTEM SIGNAL CATCHER EARLY
+	// NOTE: once raw mode is on, Ctrl+C no longer generates SIGINT
+	// (raw mode disables ISIG). This only catches external kills.
 	// ========================================================
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(quit) // Clean up the signal listener when this function exits!
+	defer signal.Stop(quit)
 
 	// 4. Wait for the Daemon's response, a Timeout, or a Ctrl+C
 	var res *ShellRequestResponse
-
 	select {
 	case res = <-responseCh:
-
 		if !res.Success {
 			return fmt.Errorf("server failed to start the shell")
 		}
 		log.Printf("Shell approved! Assigned ChannelID: %d. Hooking up terminal...", res.ChannelID)
 	case <-time.After(SHELL_REQUEST_TIMEOUT):
 		c.mu.Lock()
-		delete(c.pendingShells, reqID) // Clean up map
+		delete(c.pendingShells, reqID)
 		c.mu.Unlock()
 		return fmt.Errorf("timed out waiting for shell approval")
 	case <-quit:
 		// User pressed Ctrl+C BEFORE the shell was approved!
 		log.Printf("\r\n[wireforge] Cancelled by user. Aborting shell request.\r\n")
 		c.mu.Lock()
-		delete(c.pendingShells, reqID) // Clean up map so event loop ignores late replies
-
+		delete(c.pendingShells, reqID)
+		c.mu.Unlock() // FIX: was missing — deadlocked the client on any later c.mu.Lock()
 		return nil
 	}
+
 	stdinFd := int(os.Stdin.Fd())
 
-	pipe := NewPipe(res.ChannelID, c.session)
-
-	stream := c.session.AttachChannel(res.ChannelID, pipe, false)
-	defer c.session.closeChannel(res.ChannelID)
+	Channel, ok := c.session.NewChannelWithID(res.ChannelID, true)
+	if !ok {
+		return fmt.Errorf("client failed to start the shell")
+	}
+	defer Channel.Close()
 	log.Printf("Client Shell Pipe Created, With Channel ID %d \r\n", res.ChannelID)
 
-	//defer c.session.DeleteActiveChannel(res.ChannelID)
-	//defer stream.Close()
+	// notifyDaemonClosed tells the daemon to kill the remote PTY when WE
+	// initiate the exit. Fire-and-forget; we do not wait for a reply.
+	notifyDaemonClosed := func() {
+		c.session.WritePacket(MsgClientChannelClosed,
+			&ChannelClosed{ChannelID: res.ChannelID})
+	}
 
 	// ========================================================
 	// TERMINAL RAW MODE
 	// ========================================================
-	//stdinFd := int(os.Stdin.Fd())
-
-	// Put the local terminal into Raw Mode so every keystroke (like Tab and Arrows)
-	// is sent immediately to the remote PTY.
-
 	oldState, err := term.MakeRaw(stdinFd)
 	if err != nil {
 		return fmt.Errorf("failed to set raw terminal mode: %v", err)
 	}
-
 	log.Printf("Client Old Shell Preserved, Starting the Raw Shell\r\n")
-
-	// Guarantee the terminal goes back to normal when we disconnect!
 	defer term.Restore(stdinFd, oldState)
 
-	shellDone := make(chan struct{})
+	shellDone := make(chan struct{}) // remote side ended (daemon close / conn drop)
+	localQuit := make(chan struct{}) // local escape key or stdin EOF
+
+	// ========================================================
+	// WINDOW RESIZE WATCHER (SIGWINCH)
+	// ========================================================
 	sigwinch := make(chan os.Signal, 1)
-	signal.Notify(sigwinch, syscall.Signal(28))
+	signal.Notify(sigwinch, syscall.Signal(28)) // SIGWINCH
 	defer signal.Stop(sigwinch)
 
 	go func() {
 		for {
 			select {
 			case <-sigwinch:
-				// Read your laptop terminal's new dimensions
 				cols, rows, err := term.GetSize(stdinFd)
 				if err == nil {
 					resizeReq := &WindowResize{
@@ -1319,42 +1349,80 @@ func (c *Client) RequestShell(shellPath, username string) error {
 						Rows:      uint16(rows),
 						Cols:      uint16(cols),
 					}
-					// Send the new size to the daemon!
-					c.session.WritePacket(MsgClientWindowResize, resizeReq)
+					c.session.WritePacket(MsgClientPTYResize, resizeReq)
 				}
-
 			case <-shellDone:
-				return // Stop monitoring when the shell closes
+				return
+			case <-localQuit:
+				return
 			}
 		}
 	}()
 
-	// 7. Pipe local terminal input to the daemon
+	// 7. Pipe local terminal input to the daemon, scanning for the escape key.
+	//    NOTE: in raw mode Ctrl+D is just byte 0x04 forwarded to the remote
+	//    shell — it never produces a local EOF, so io.Copy could never exit
+	//    here. Ctrl+] (0x1D) is our reserved local escape instead.
 	go func() {
-		io.Copy(stream, os.Stdin)
-		// If the user types 'exit' or presses Ctrl+D, close the stream
-		stream.Close()
+		buf := make([]byte, MAX_PAYLOAD_LEN)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				if i := bytes.IndexByte(buf[:n], escapeByte); i >= 0 {
+					// Forward anything typed before the escape, then bail.
+					if i > 0 {
+						Channel.Write(buf[:i])
+					}
+					close(localQuit)
+					return
+				}
+				if _, werr := Channel.Write(buf[:n]); werr != nil {
+					// Channel closed (remote exit already in progress).
+					// shellDone path handles cleanup; just stop reading.
+					return
+				}
+			}
+			if err != nil {
+				// Genuine stdin EOF (piped input / terminal closed).
+				close(localQuit)
+				return
+			}
+		}
 	}()
 
-	// 8. Pipe daemon output to local terminal
-
+	// 8. Pipe daemon output to local terminal.
+	//    Returns when the daemon sends MsgServerChannelClosed (or the
+	//    connection drops) and PipeStream.Read yields io.EOF.
 	go func() {
-		io.Copy(os.Stdout, stream)
-		close(shellDone) // Trigger the select block below when the server hangs up
+		io.Copy(os.Stdout, Channel)
+		close(shellDone)
 	}()
 
 	// 9. The Main Wait Block
 	select {
 	case <-shellDone:
-		log.Printf("\r\n[wireforge] Remote shell exited or connection dropped.\r\n")
+		// Remote-initiated: shell exited (Ctrl+D/exit) or connection dropped.
+		// Daemon already knows; nothing to send.
+		log.Printf("[wireforge] Remote shell exited or connection dropped.\r\n")
+		Channel.Close()
+	case <-localQuit:
+		// Local-initiated: escape key or stdin EOF. Tell the daemon so it
+		// kills the remote PTY, then exit immediately without waiting.
+		log.Printf("[wireforge] Escape pressed. Closing shell locally.\r\n")
+		notifyDaemonClosed()
+		Channel.Close()
 	case <-quit:
-		// Catches OS kills (like Docker stop) while in Raw mode
-		log.Printf("\r\nSIGTERM CAUGHT: Client Shell is being stopped\r\n")
-
+		// External SIGTERM/SIGINT (e.g. docker stop) while in raw mode.
+		log.Printf("SIGTERM CAUGHT: Client Shell is being stopped\r\n")
+		notifyDaemonClosed()
+		Channel.Close()
 	}
 
 	return nil
-
+	// Deferred on the way out (LIFO): signal.Stop(sigwinch),
+	// term.Restore (terminal back to normal), Channel.Close()
+	// (local teardown — wakes the stdout copier if it's still blocked),
+	// signal.Stop(quit).
 }
 
 func (c *Client) CreateENV(envType, RequestedName string, prvKey crypto.Signer) error {
@@ -1488,10 +1556,15 @@ func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) 
 
 // startInteractivePTY consolidates the raw terminal setting and stream copying
 func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
-	pipe := NewPipe(channelID, c.session)
-	stream := c.session.AttachChannel(channelID, pipe, false)
-	defer c.session.closeChannel(channelID)
-	//defer stream.Close()
+
+	Channel, ok := c.session.NewChannelWithID(channelID, true) // inbound ring -> localConn
+	if !ok {
+		log.Println("bluhhhhhhh")
+		return fmt.Errorf("client failed to start the shell")
+	}
+
+	//defer c.session.CloseActiveChannel(channelID)
+	defer Channel.Close()
 
 	oldState, err := term.MakeRaw(stdinFd)
 	if err != nil {
@@ -1515,7 +1588,7 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 						Rows:      uint16(rows),
 						Cols:      uint16(cols),
 					}
-					c.session.WritePacket(MsgClientWindowResize, resizeReq)
+					c.session.WritePacket(MsgClientPTYResize, resizeReq)
 				}
 			case <-shellDone:
 				return
@@ -1524,11 +1597,11 @@ func (c *Client) startInteractivePTY(channelID uint32, stdinFd int) error {
 	}()
 
 	go func() {
-		io.Copy(stream, os.Stdin)
-		stream.Close()
+		io.Copy(Channel, os.Stdin)
+		Channel.Close()
 	}()
 
-	io.Copy(os.Stdout, stream)
+	io.Copy(os.Stdout, Channel)
 	close(shellDone)
 
 	return nil

@@ -5,6 +5,7 @@ import "encoding/binary"
 //every connection from/to the daemon gets a chanID() + every connection from/to the Client gets a chanID()
 //daemon and client has to be aware of the all active channels
 
+// if data > maxpacketlen, we chunk data into (maxpacklen-[1][4][4])
 type Channel struct {
 	ChannelID uint32
 	DataLen   uint32

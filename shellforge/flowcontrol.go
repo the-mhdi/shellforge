@@ -120,7 +120,7 @@ func newChanFlow() *chanFlow {
 // getFlow returns the flow state for id, creating it lazily. Lazy creation is
 // safe precisely because the initial window is a shared constant: whichever
 // side touches the channel first initialises identical accounting on both ends.
-func (s *Session) getFlow(id uint32) *chanFlow {
+func (s *stream) getFlow(id uint32) *chanFlow {
 	s.flowsMu.Lock()
 	defer s.flowsMu.Unlock()
 	if s.flows == nil {
@@ -136,7 +136,7 @@ func (s *Session) getFlow(id uint32) *chanFlow {
 
 // closeFlow tears down flow state for a channel and wakes any sender blocked on
 // a depleted window so it returns instead of hanging forever.
-func (s *Session) closeFlow(id uint32) {
+func (s *stream) closeFlow(id uint32) {
 	s.flowsMu.Lock()
 	f := s.flows[id]
 	delete(s.flows, id)
@@ -152,7 +152,7 @@ func (s *Session) closeFlow(id uint32) {
 
 // closeAllFlows wakes and drops every channel's flow state. Called from
 // Session.closeAllChannels during shutdown.
-func (s *Session) closeAllFlows() {
+func (s *stream) closeAllFlows() {
 	s.flowsMu.Lock()
 	flows := s.flows
 	s.flows = make(map[uint32]*chanFlow)
@@ -173,10 +173,14 @@ func (s *Session) closeAllFlows() {
 //
 // n is always <= MAX_PACKET_LEN (framing limit) which is < INITIAL_WINDOW, so a
 // single chunk can always eventually be admitted; there is no self-deadlock.
-func (s *Session) acquireSendWindow(id uint32, n int) error {
+func (s *stream) acquireSendWindow(id uint32, n int) error {
 	if n <= 0 {
 		return nil
 	}
+	if s.closed {
+		return io.ErrClosedPipe
+	}
+
 	f := s.getFlow(id)
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -192,7 +196,7 @@ func (s *Session) acquireSendWindow(id uint32, n int) error {
 
 // grantSendWindow is invoked from the read loop when a WindowAdjust arrives. It
 // is intentionally trivial and non-blocking so the reader never stalls.
-func (s *Session) grantSendWindow(id uint32, n uint32) {
+func (s *stream) grantSendWindow(id uint32, n uint32) {
 	f := s.getFlow(id)
 	f.mu.Lock()
 	f.sendWindow += int64(n)
@@ -204,7 +208,7 @@ func (s *Session) grantSendWindow(id uint32, n uint32) {
 // the receive ring (PipeStream.Read, or a sink-drain goroutine). It batches the
 // credit and, once the threshold is crossed, emits a WindowAdjust so the peer
 // may resume sending. Runs in the consumer goroutine, never the read loop.
-func (s *Session) returnRecvWindow(id uint32, n int) error {
+func (s *stream) returnRecvWindow(id uint32, n int) error {
 	if n <= 0 {
 		return nil
 	}
@@ -222,7 +226,7 @@ func (s *Session) returnRecvWindow(id uint32, n int) error {
 		return nil
 	}
 	wa := &WindowAdjust{ChannelID: id, Increment: flush}
-	return s.WritePacket(MsgWindowAdjust, wa)
+	return s.session.WritePacket(MsgWindowAdjust, wa)
 }
 
 // -----------------------------------------------------------------------------
@@ -238,12 +242,6 @@ func (s *Session) returnRecvWindow(id uint32, n int) error {
 //
 // data MUST be <= MAX_PACKET_LEN; callers already chunk to bufferPool/io.Copy
 // sizes (<= 64 KiB), well under both the framing limit and INITIAL_WINDOW.
-func (s *Session) SendChannelData(msgType uint8, channelID uint32, data []byte) error {
-	if err := s.acquireSendWindow(channelID, len(data)); err != nil {
-		return err
-	}
-	return s.writeChannelData(msgType, channelID, data)
-}
 
 // attachSinkChannel registers a receive buffer (a PipeStream) for a channel
 // whose ultimate destination is a plain writer -- a forwarded net.Conn, or
@@ -258,67 +256,24 @@ func (s *Session) SendChannelData(msgType uint8, channelID uint32, data []byte) 
 // This is what removes head-of-line blocking for FORWARDS: the slow socket now
 // backs up into the ring (and then, via withheld WindowAdjusts, onto the remote
 // sender) instead of stalling the shared reader inside cc.Write.
-func (s *Session) AttachChannel(id uint32, pipe io.ReadWriteCloser, closeAfterRead bool) *PipeStream {
 
-	if pp, ok := pipe.(*PipeStream); ok {
-		s.addActiveChannel(id, pipe)
-		return pp
-	}
+// it assigns a channel id to a io file , now you can read from channel to the file or write to file to be written to channel
 
-	p := NewPipe(id, s)
-	s.addActiveChannel(id, p)
-	//for write only channels :
-	go func() {
-		_, _ = io.Copy(pipe, p) // p.Read drains the ring and returns credits
-		if closeAfterRead {
-			if c, ok := pipe.(io.Closer); ok {
-				_ = c.Close()
-			}
-		}
-	}()
-	return p
-}
-
-// blocks and waits for client to signal open
-func (s *Session) AttachChannelWithConfirmation(id uint32, pipe io.ReadWriteCloser, closeAfterRead bool) (*PipeStream, bool) {
-
-	if pp, ok := pipe.(*PipeStream); ok {
-		open := s.addActiveChannelWithConfirmation(id, pipe)
-		if open {
-			return pp, true
-		}
-		s.closeChannel(id)
-		return nil, false
-	}
-
-	p := NewPipe(id, s)
-	open := s.addActiveChannelWithConfirmation(id, p)
-	if open {
-		//for write only channels :
-		go func() {
-			_, _ = io.Copy(pipe, p) // p.Read drains the ring and returns credits
-			if closeAfterRead {
-				if c, ok := pipe.(io.Closer); ok {
-					_ = c.Close()
-				}
-			}
-		}()
-		return p, true
-	}
-	s.closeChannel(id)
-	return nil, false
-}
+// *****************************
 
 // closeChannel is the one-stop teardown for an active channel: it closes the
 // registered object (a PipeStream, which unblocks its drain goroutine and
 // closes the underlying sink), removes it from the active map, and tears down
 // flow state (DeleteActiveChannel calls closeFlow).
-func (s *Session) closeChannel(id uint32) {
-	if obj, ok := s.GetActiveChannel(id); ok {
-		if c, ok := obj.(io.Closer); ok {
-			_ = c.Close()
+func (s *stream) CloseActiveChannel(id uint32) {
+	if c, ok := s.getActiveChannel(id); ok {
+
+		//log.Printf("asdsad\n")
+		_ = c.Close()
+		if c.sessionTied {
+			s.session.Close()
 		}
-		s.DeleteActiveChannel(id)
+		s.deleteActiveChannel(id)
 	}
-	log.Printf("[Session flow] channel %d closed\n", id)
+	log.Printf("[Session flow] channel %d closed\r\n", id)
 }

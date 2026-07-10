@@ -1,16 +1,13 @@
 package shellforge
 
-import (
-	"errors"
-	"io"
-	"os"
-	"sync"
-
-	"github.com/creack/pty"
-)
+/*
+// connection -> pipe(channel) -> read
+//write -> pipe(channel) -> connection
 
 // pipe or Channel represents a single multiplexed stream inside our secure session.
 // It implements io.ReadWritecloser.
+
+// pipe is the connection beteen server / client
 type PipeStream struct {
 	id      uint32 //== channel id
 	session *Session
@@ -24,7 +21,7 @@ type PipeStream struct {
 	closed   bool
 
 	fileMu sync.Mutex
-	file   *os.File
+	file   io.ReadWriteCloser
 }
 
 func NewPipe(id uint32, s *Session) *PipeStream {
@@ -97,7 +94,13 @@ func (p *PipeStream) Read(b []byte) (int, error) {
 	// p.mu (returnRecvWindow may write a WindowAdjust to the socket) and off the
 	// shared read loop, so a slow control write can never deadlock delivery.
 	if n > 0 && p.session != nil {
-		_ = p.session.returnRecvWindow(p.id, n)
+		if err := p.session.returnRecvWindow(p.id, n); err != nil {
+			// A lost WindowAdjust means the peer's send window shrinks
+			// PERMANENTLY -- the channel slowly strangles itself and eventually
+			// stalls forever. Don't hide it; the session is almost certainly
+			// dying anyway, so surface it.
+			log.Printf("[flow] channel %d: failed to return %d bytes of recv window: %v", p.id, n, err)
+		}
 	}
 	return n, nil
 }
@@ -162,7 +165,7 @@ func (p *PipeStream) SetPTY(f *os.File) {
 }
 
 // Resize forcefully changes the window dimensions of the active PTY.
-func (p *PipeStream) Resize(rows, cols uint16) error {
+func (p *PipeStream) ResizePTY(rows, cols uint16) error {
 	p.fileMu.Lock()
 	defer p.fileMu.Unlock()
 
@@ -171,5 +174,8 @@ func (p *PipeStream) Resize(rows, cols uint16) error {
 	}
 
 	// This sends the SIGWINCH signal directly to the remote bash process!
-	return pty.Setsize(p.file, &pty.Winsize{Rows: rows, Cols: cols})
+	return pty.Setsize(p.file.(*os.File), &pty.Winsize{Rows: rows, Cols: cols})
 }
+
+
+*/

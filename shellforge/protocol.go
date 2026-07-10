@@ -16,8 +16,9 @@ import (
 
 var ErrCanNotParseMalformedPacket = errors.New("ErrCanNotParseMalformedPacket")
 
-const MAX_PACKET_LEN uint32 = 256 * 1024 //defu 64kb
-const MIN_PACKET_LEN uint32 = 4          // Minimum packet size to prevent abuse (e.g., empty packets)
+const MAX_PAYLOAD_LEN uint32 = 64 * 1024                       //defu 64kb
+const MAX_PACKET_LEN uint32 = (MAX_PAYLOAD_LEN + 5 + 255 + 64) //64 * 1024 + 4+1+...+max255 + max 64byte
+const MIN_PACKET_LEN uint32 = 4                                // Minimum packet size to prevent abuse (e.g., empty packets)
 const MAX_AUTH_RETRY uint8 = 5
 
 const CLEANUP_INTERVAL time.Duration = 5 * time.Minute
@@ -34,9 +35,10 @@ const MAX_WAIT_FOR_CHAN_CONFIRM = 5 * time.Second
 const SESSION_DEADLINE_DEDAULT = 15 * time.Minute
 const SESSION_HANDSHAKE_DEADLINE_DEDAULT = 1 * time.Minute
 
-const PIPE_RING_CAPACITY = 2 * 1024 * 1024 // 2 MB
+const PIPE_RING_CAPACITY = 4 * 1024 * 1024 // 2 MB
 const INITIAL_WINDOW uint32 = PIPE_RING_CAPACITY
 const WINDOW_ADJUST_THRESHOLD uint32 = INITIAL_WINDOW / 8
+const MAX_CHANNEL_DATA_LEN = 32 * 1024
 
 const (
 	AuthMethodPassword  uint8 = 0x01 // 1 << 0 (0000 0001) - Password/PAM
@@ -46,9 +48,9 @@ const (
 
 const (
 	// Encryption Ciphers
-	CipherChaCha20Poly1305 uint16 = 0x0001
-	CipherAES256GCM        uint16 = 0x0002
-	CipherAES128GCM        uint16 = 0x0003
+	CipherChaCha20Poly1305 uint16 = 0x0001 //16byte auth tag
+	CipherAES256GCM        uint16 = 0x0002 //16byte gcm tag
+	CipherAES128GCM        uint16 = 0x0003 //16byte gcm tag
 
 	//supported Key Exchange (KEX) Algorithms
 	KexX25519               uint16 = 0x1000
@@ -141,7 +143,7 @@ const (
 	MsgClientSessionClosed uint8 = 249
 	MsgServerSessionClosed uint8 = 250
 
-	MsgClientWindowResize = 25
+	MsgClientPTYResize = 25
 
 	/////////////////////////////////////////
 	MsgServerAuthResponse           uint8 = 30
@@ -160,13 +162,14 @@ const (
 	MsgWindowAdjust          = 24
 )
 
+// 4+1+...+max255 + max 64byte so max packet len is = payload + all this so payload is max packet len
 type PacketFrame struct {
 	PacketLength uint32
 
 	PaddingLength uint8
 	Payload       []byte
 	Padding       []byte
-	MAC           []byte
+	MAC           []byte //not used just for beauty
 }
 
 type Payload struct {
@@ -182,22 +185,26 @@ type Session struct {
 	isDaemon bool     // 1=daemon , 0 = client
 	conn     net.Conn //connection between server <-> client
 
-	//shells   []*Shell
+	//streamIDCounter atomic.Uint32
+	//activeStreamMu  sync.RWMutex
+	Stream  *stream
+	shells  map[uint32]*Shell //map if channels to their shells on one session
+	shellMu sync.Mutex
 	// Multiplexing
-	flows   map[uint32]*chanFlow
-	flowsMu sync.Mutex
+	//flows   map[uint32]*chanFlow
+	//flowsMu sync.Mutex
 
-	channelCounter       atomic.Uint32
-	activeChannelsMu     sync.RWMutex
-	activeChannels       map[uint32]io.ReadWriteCloser //map[chanID]*pipe map[chanID]net.conn  //connection between server/client and their users/io devices
-	channelOpenConfirmed map[uint32]chan bool          // Tracks which channels have been confirmed open by client
-	ConfirmChannelsMu    sync.RWMutex
+	//channelCounter       atomic.Uint32
+	//activeChannelsMu     sync.RWMutex
+	//activeChannels       map[uint32]*channel  //map[chanID]*pipe map[chanID]net.conn  //connection between server/client and their users/io devices
+	//channelOpenConfirmed map[uint32]chan bool // Tracks which channels have been confirmed open by client
+	//ConfirmChannelsMu    sync.RWMutex
 	// Cryptography
 	encrypter cipher.AEAD
 	decrypter cipher.AEAD
 
-	writeSeq uint64 // Tracks packets sent
-	readSeq  uint64 // Tracks packets received
+	writeSeq atomic.Uint64 // Tracks packets sent
+	readSeq  atomic.Uint64 // Tracks packets received
 
 	rdLen       [4]byte // stack-ish, no heap alloc
 	rdNonce     []byte  // allocated once == decrypter.NonceSize()
@@ -222,16 +229,43 @@ type Session struct {
 }
 
 func NewSession(conn net.Conn) *Session {
-	return &Session{
-		conn:                 conn,
-		activeChannels:       make(map[uint32]io.ReadWriteCloser),
-		flows:                make(map[uint32]*chanFlow),
-		channelOpenConfirmed: make(map[uint32]chan bool, 1),
-		forwardMap:           make(map[string]string),
-		Closed:               make(chan struct{}),
+	s := &Session{
+		conn: conn,
+		//	activeChannels:       make(map[uint32]io.ReadWriteCloser),
+		//flows:                make(map[uint32]*chanFlow),
+		//channelOpenConfirmed: make(map[uint32]chan bool, 1),
+		shells:     make(map[uint32]*Shell),
+		forwardMap: make(map[string]string),
+		Closed:     make(chan struct{}),
 	}
+	s.Stream = NewStream(s)
+	return s
 }
 
+func (s *Session) NewShell(channelid uint32) *Shell {
+	s.shellMu.Lock()
+	defer s.shellMu.Unlock()
+	sh := newShell(channelid)
+	s.shells[channelid] = sh
+	return sh
+
+}
+
+func (s *Session) GetShell(channelid uint32) *Shell {
+	s.shellMu.Lock()
+	defer s.shellMu.Unlock()
+	if shell, ok := s.shells[channelid]; ok {
+		return shell
+	}
+	return nil
+}
+
+func (s *Session) DeleteShell(channelid uint32) {
+	s.shellMu.Lock()
+	defer s.shellMu.Unlock()
+	delete(s.shells, channelid)
+
+}
 func (s *Session) ReadPacket() (*PacketFrame, error) {
 
 	if !s.readerOwner.CompareAndSwap(0, 1) {
@@ -268,8 +302,8 @@ func (s *Session) ReadPacket() (*PacketFrame, error) {
 		if s.rdNonce == nil {
 			s.rdNonce = make([]byte, s.decrypter.NonceSize())
 		}
-		binary.BigEndian.PutUint64(s.rdNonce[len(s.rdNonce)-8:], s.readSeq)
-		s.readSeq++
+		binary.BigEndian.PutUint64(s.rdNonce[len(s.rdNonce)-8:], s.readSeq.Load())
+		s.readSeq.Add(1)
 		var err error
 		plaintext, err = s.decrypter.Open(dataBuf[:0], s.rdNonce, dataBuf, s.rdLen[:])
 		if err != nil {
@@ -361,8 +395,8 @@ func (s *Session) WritePacketRaw(msgType uint8, data []byte) error {
 	if s.encrypter != nil {
 		// Create the Nonce using the Write Sequence Number
 		nonce := make([]byte, s.encrypter.NonceSize())
-		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], s.writeSeq)
-		s.writeSeq++
+		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], s.writeSeq.Load())
+		s.writeSeq.Add(1)
 
 		// AEAD adds a 16-byte MAC tag to the end of the ciphertext.
 		// Our total wire length is plaintext length + 16 overhead bytes.
@@ -414,9 +448,14 @@ func (s *Session) writeChannelData(msgType uint8, channelID uint32, data []byte)
 	binary.BigEndian.PutUint32(p[6:10], uint32(len(data)))
 	copy(p[10:10+len(data)], data) // the ONLY data copy
 	if padLen > 0 {
-		if _, err := rand.Read(p[plainLen-int(padLen):]); err != nil {
-			return err
-		}
+		// Zero padding, NOT crypto/rand. This function is only ever called on the
+		// encrypted channel-data hot path (s.encrypter != nil below): the padding
+		// bytes are covered by the AEAD, so the ciphertext hides their content --
+		// random padding adds no security here. crypto/rand.Read is a getrandom(2)
+		// syscall PER PACKET; at shell/forward packet rates that syscall shows up
+		// as measurable latency jitter. (The buffer is reused, so explicitly clear
+		// stale bytes from previous packets.)
+		clear(p[plainLen-int(padLen):])
 	}
 
 	pktLen := plainLen + s.encrypter.Overhead()
@@ -429,8 +468,8 @@ func (s *Session) writeChannelData(msgType uint8, channelID uint32, data []byte)
 	if s.wrNonce == nil {
 		s.wrNonce = make([]byte, s.encrypter.NonceSize())
 	}
-	binary.BigEndian.PutUint64(s.wrNonce[len(s.wrNonce)-8:], s.writeSeq)
-	s.writeSeq++
+	binary.BigEndian.PutUint64(s.wrNonce[len(s.wrNonce)-8:], s.writeSeq.Load())
+	s.writeSeq.Add(1)
 
 	// Seal appends ciphertext+tag right after the 4-byte header; AAD = header.
 	// dst (out[4:]) and plaintext (p) don't overlap -> valid.
@@ -445,112 +484,101 @@ func (s *Session) writeChannelData(msgType uint8, channelID uint32, data []byte)
 	return err
 }
 
+func (s *Session) SendChannelData(msgType uint8, channelID uint32, data []byte) error {
+	if err := s.Stream.acquireSendWindow(channelID, len(data)); err != nil {
+		return err
+	}
+	return s.writeChannelData(msgType, channelID, data)
+}
+
 // IsClientChannelID reports whether id belongs to the client-initiated
 // namespace (top bit set).
-func IsClientChannelID(id uint32) bool {
-	return id&ClientChannelIDBit != 0
-}
 
 // for server-initiated channel ID.
 //
 //	The top bit is masked off so these IDs always live in the low half of the space and can
 //
 // never collide with client-initiated IDs (defensive against counter wrap).
-func (s *Session) IncrementChannelID() uint32 {
-	return s.channelCounter.Add(1) &^ ClientChannelIDBit
-}
-
-// IncrementClientChannelID allocates a client-initiated channel ID (top bit
-// set). Only the peer that opens a channel -- the client, for `-L` local
-// forwards -- calls this.
-func (s *Session) IncrementClientChannelID() uint32 {
-	return s.channelCounter.Add(1) | ClientChannelIDBit
-}
-
-func (s *Session) addActiveChannel(id uint32, conn io.ReadWriteCloser) {
-	s.activeChannelsMu.Lock()
-	defer s.activeChannelsMu.Unlock()
-	if s.activeChannels == nil {
-		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
-	}
-	s.activeChannels[id] = conn
-}
-
-func (s *Session) AddActiveChannelIfAbsent(id uint32, conn io.ReadWriteCloser) bool {
-	s.activeChannelsMu.Lock()
-	defer s.activeChannelsMu.Unlock()
-	if s.activeChannels == nil {
-		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
-	}
-	if _, exists := s.activeChannels[id]; exists {
-		return false
-	}
-	s.activeChannels[id] = conn
-	return true
-}
-
-func (s *Session) GetActiveChannel(id uint32) (io.ReadWriteCloser, bool) {
-	s.activeChannelsMu.RLock()
-	defer s.activeChannelsMu.RUnlock()
-	conn, exists := s.activeChannels[id]
-	return conn, exists
-}
+//func (s *Session) IncrementChannelID() uint32 {
+//	return s.channelCounter.Add(1) &^ ClientChannelIDBit
+//}
+//
+//// IncrementClientChannelID allocates a client-initiated channel ID (top bit
+//// set). Only the peer that opens a channel -- the client, for `-L` local
+//// forwards -- calls this.
+//func (s *Session) IncrementClientChannelID() uint32 {
+//	return s.channelCounter.Add(1) | ClientChannelIDBit
+//}
 
 /*
-func (s *Session) WaitForClientChannelOpenConfirmed(id uint32) bool {
+	func (s *Session) addActiveChannel(id uint32, conn io.ReadWriteCloser) {
+		s.activeChannelsMu.Lock()
+		defer s.activeChannelsMu.Unlock()
+		if s.activeChannels == nil {
+			s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+		}
+		s.activeChannels[id] = conn
+	}
+
+	func (s *Session) AddActiveChannelIfAbsent(id uint32, conn io.ReadWriteCloser) bool {
+		s.activeChannelsMu.Lock()
+		defer s.activeChannelsMu.Unlock()
+		if s.activeChannels == nil {
+			s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+		}
+		if _, exists := s.activeChannels[id]; exists {
+			return false
+		}
+		s.activeChannels[id] = conn
+		return true
+	}
+
+	func (s *Session) GetActiveChannel(id uint32) (io.ReadWriteCloser, bool) {
+		s.activeChannelsMu.RLock()
+		defer s.activeChannelsMu.RUnlock()
+		conn, exists := s.activeChannels[id]
+		return conn, exists
+	}
+
+	func (s *Session) addActiveChannelWithConfirmation(id uint32, conn io.ReadWriteCloser) bool {
+		s.activeChannelsMu.Lock()
+		if s.activeChannels == nil {
+			s.activeChannels = make(map[uint32]io.ReadWriteCloser)
+		}
+		s.activeChannels[id] = conn
+		s.activeChannelsMu.Unlock()
 
 		s.ConfirmChannelsMu.Lock()
-		defer s.ConfirmChannelsMu.Unlock()
-
 		if s.channelOpenConfirmed == nil {
-			s.channelOpenConfirmed = make(map[uint32]chan bool)
+			s.channelOpenConfirmed = make(map[uint32]chan bool, 1)
+		}
+		s.channelOpenConfirmed[id] = make(chan bool, 1)
+		s.ConfirmChannelsMu.Unlock()
 
-			s.channelOpenConfirmed[id] = true
-			return true
+		//wait for confirmation or time out
+		select {
+		case open := <-s.channelOpenConfirmed[id]:
+			if open {
+				log.Printf("client confirmed channel opne ID: %d", id)
+			} else {
+				log.Printf("client couldnt open channel ID: %d", id)
+			}
+
+			return open
+		case <-time.After(MAX_WAIT_FOR_CHAN_CONFIRM):
+			log.Printf("channel Confirmation Timeout,  ID : %d\n", id)
+			return false
 		}
 
-		return false
+}
+
+	func (s *Session) deleteActiveChannel(id uint32) {
+		s.activeChannelsMu.Lock()
+		delete(s.activeChannels, id)
+		s.activeChannelsMu.Unlock()
+		s.closeFlow(id) // wake any blocked sender; drop credit state
 	}
 */
-func (s *Session) addActiveChannelWithConfirmation(id uint32, conn io.ReadWriteCloser) bool {
-	s.activeChannelsMu.Lock()
-	if s.activeChannels == nil {
-		s.activeChannels = make(map[uint32]io.ReadWriteCloser)
-	}
-	s.activeChannels[id] = conn
-	s.activeChannelsMu.Unlock()
-
-	s.ConfirmChannelsMu.Lock()
-	if s.channelOpenConfirmed == nil {
-		s.channelOpenConfirmed = make(map[uint32]chan bool, 1)
-	}
-	s.channelOpenConfirmed[id] = make(chan bool, 1)
-	s.ConfirmChannelsMu.Unlock()
-
-	//wait for confirmation or time out
-	select {
-	case open := <-s.channelOpenConfirmed[id]:
-		if open {
-			log.Printf("client confirmed channel opne ID: %d", id)
-		} else {
-			log.Printf("client couldnt open channel ID: %d", id)
-		}
-
-		return open
-	case <-time.After(MAX_WAIT_FOR_CHAN_CONFIRM):
-		log.Printf("channel Confirmation Timeout,  ID : %d\n", id)
-		return false
-	}
-
-}
-
-func (s *Session) DeleteActiveChannel(id uint32) {
-	s.activeChannelsMu.Lock()
-	delete(s.activeChannels, id)
-	s.activeChannelsMu.Unlock()
-	s.closeFlow(id) // wake any blocked sender; drop credit state
-}
-
 func (s *Session) AttachNewSocket(newConn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -616,13 +644,12 @@ func (s *Session) shutdown() error {
 		s.mu.Lock()
 		conn := s.conn
 		s.mu.Unlock()
-
 		if s.User == "" {
 			log.Printf("[Log] Session [%x] closed With No User\r\n", s.ID[:10])
 		} else {
 			log.Printf("[Log] user [%s] Session [%x] closed \r\n", s.User, s.ID)
 		}
-
+		s.Stream.Close()
 		if conn != nil {
 			closeErr = conn.Close()
 		}
@@ -635,16 +662,27 @@ func (s *Session) SetDeadline(t time.Time) error {
 }
 
 func (s *Session) closeAllChannels() {
-	s.activeChannelsMu.Lock()
-	chans := make([]io.ReadWriteCloser, 0, len(s.activeChannels))
-	for _, ch := range s.activeChannels {
+	s.Stream.activeChannelsMu.Lock()
+	chans := make([]io.ReadWriteCloser, 0, len(s.Stream.activeChannels))
+	for _, ch := range s.Stream.activeChannels {
 		chans = append(chans, ch)
 	}
-	s.activeChannels = make(map[uint32]io.ReadWriteCloser)
-	s.activeChannelsMu.Unlock()
+	s.Stream.activeChannels = make(map[uint32]*channel)
+	s.Stream.activeChannelsMu.Unlock()
 
 	for _, ch := range chans {
 		ch.Close()
 	}
-	s.closeAllFlows()
+	s.Stream.closeAllFlows()
+}
+
+func (s *Session) NewChannel(sessionTie bool) (uint32, *channel) {
+	return s.Stream.NewChannel(sessionTie)
+}
+
+func (s *Session) NewChannelWithID(id uint32, sessionTie bool) (*channel, bool) {
+	return s.Stream.NewChannelWithID(id, sessionTie)
+}
+func (s *Session) GetActiveChannel(channelID uint32) (*channel, bool) {
+	return s.Stream.getActiveChannel(channelID)
 }

@@ -1,13 +1,6 @@
 package shellforge
 
-import (
-	"bytes"
-	"crypto/rand"
-	"io"
-	"testing"
-	"time"
-)
-
+/*
 // feedAll pushes data in fixed-size chunks, the way the event loop would.
 func feedAll(t *testing.T, p *PipeStream, data []byte, chunk int) {
 	t.Helper()
@@ -114,3 +107,4 @@ func TestPipeCloseDrainsThenEOF(t *testing.T) {
 		t.Fatalf("expected io.ErrClosedPipe after close, got %v", err)
 	}
 }
+*/

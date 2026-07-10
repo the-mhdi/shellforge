@@ -3,6 +3,7 @@ package shellforge
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -18,17 +20,33 @@ import (
 
 // the remote shell that daemon opens
 type Shell struct {
-	ID   []byte // 8 bytes random ID for this shell session
-	PTY  *os.File
-	Pipe io.ReadWriteCloser
+	ID  uint32 // 8== channel id this shell runs on
+	PTY *os.File
+	//Pipe   io.ReadWriteCloser
+	fileMu sync.Mutex
 }
 
-func newShell(PTY *os.File, Pipe io.ReadWriteCloser) *Shell {
+func newShell(ID uint32) *Shell {
 	return &Shell{
-		ID:   make([]byte, 8),
-		PTY:  PTY,
-		Pipe: Pipe,
+		ID: ID,
 	}
+}
+
+func (p *Shell) SetPTY(f *os.File) {
+	p.fileMu.Lock()
+	p.PTY = f
+	p.fileMu.Unlock()
+}
+func (p *Shell) ResizePTY(rows, cols uint16) error {
+	p.fileMu.Lock()
+	defer p.fileMu.Unlock()
+
+	if p.PTY == nil {
+		return errors.New("no active PTY to resize")
+	}
+
+	// This sends the SIGWINCH signal directly to the remote bash process!
+	return pty.Setsize(p.PTY, &pty.Winsize{Rows: rows, Cols: cols})
 }
 
 // Client requests a shell and provides a temporary RequestID
@@ -56,7 +74,7 @@ type WindowResize struct {
 }
 
 // RunInteractiveShell spawns a shell and pipes it to our multiplexed Channel.
-func RunInteractiveShell(ctx context.Context, shellReq *ShellRequest, pipe io.ReadWriteCloser, rows, cols uint16) error {
+func (she *Shell) RunInteractiveShell(ctx context.Context, shellReq *ShellRequest, pipe *channel, rows, cols uint16) error {
 
 	var shell string
 	shell = "/bin/bash"
@@ -131,11 +149,10 @@ func RunInteractiveShell(ctx context.Context, shellReq *ShellRequest, pipe io.Re
 	// \x1b[3J -> Clears the terminal's scrollback buffer (optional, but clean)
 	// =================================================================
 	//_, _ = pipe.Write([]byte("\x1b[H\x1b[2J\x1b[3J"))
+	//sh := newShell(pipe)
 
-	if pipe, ok := pipe.(*PipeStream); ok {
-		pipe.SetPTY(ptyFd)
-		defer pipe.SetPTY(nil) // Clean up on exit
-	}
+	she.SetPTY(ptyFd)
+	defer she.SetPTY(nil) // Clean up on exit
 
 	errCh := make(chan error, 2)
 
@@ -363,7 +380,7 @@ func (p *WindowResize) Unmarshal(data []byte) error {
 	return nil
 }
 func (p *WindowResize) Type() uint8 {
-	return MsgClientWindowResize
+	return MsgClientPTYResize
 }
 
 func ParseWindowResize(data []byte) (*WindowResize, error) {
