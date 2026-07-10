@@ -998,19 +998,32 @@ func (c *Client) eventLoop() {
 				go c.session.WritePacket(MsgServerChanDataMalformed, nil)
 				continue
 			}
+			if chann, ok := c.session.Stream.getActiveChannel(ch.ChannelID); ok {
+				_, err := chann.Feed(ch.Data)
+				if err != nil {
+					log.Println(err)
+					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
+					c.session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
+					chann.Close()
 
+				}
+			} else {
+				log.Printf("Received Data with unknown Channel ID")
+				continue
+				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
+			}
 			//log.Printf("Data received on Channel %d", ch.ChannelID)
 			// Look up the session and ch id and write the data
 			//log.Printf("Data received on Channel %d", ch.ChannelID)
-			err = c.session.Stream.Feed(pkt.Payload[1:])
-			if err != nil {
+		////	err = c.session.Stream.Feed(pkt.Payload[1:])
+		//	if err != nil {
 
-				// Flow-control violation or closed pipe: drop the channel,
-				// never block the shared reader.
-				//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
-				//		session.CloseActiveChannel(ch.ChannelID)
-				c.session.WritePacket(MsgClientChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
-			}
+		// Flow-control violation or closed pipe: drop the channel,
+		// never block the shared reader.
+		//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
+		//		//		session.CloseActiveChannel(ch.ChannelID)
+		//		c.session.WritePacket(MsgClientChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
+		//	}
 
 		case MsgServerChannelClosed:
 			// The remote user disconnected

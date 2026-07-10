@@ -16,6 +16,8 @@ import (
 
 var ErrCanNotParseMalformedPacket = errors.New("ErrCanNotParseMalformedPacket")
 
+const WINDOW_IDLE_FLUSH_MIN uint32 = MAX_CHANNEL_DATA_LEN
+
 const MAX_PAYLOAD_LEN uint32 = 64 * 1024                       //defu 64kb
 const MAX_PACKET_LEN uint32 = (MAX_PAYLOAD_LEN + 5 + 255 + 64) //64 * 1024 + 4+1+...+max255 + max 64byte
 const MIN_PACKET_LEN uint32 = 4                                // Minimum packet size to prevent abuse (e.g., empty packets)
@@ -485,10 +487,21 @@ func (s *Session) writeChannelData(msgType uint8, channelID uint32, data []byte)
 }
 
 func (s *Session) SendChannelData(msgType uint8, channelID uint32, data []byte) error {
-	if err := s.Stream.acquireSendWindow(channelID, len(data)); err != nil {
-		return err
+	for len(data) > 0 {
+		want := len(data)
+		if want > int(MAX_CHANNEL_DATA_LEN) {
+			want = int(MAX_CHANNEL_DATA_LEN) // finally enforces the frame cap too
+		}
+		g, err := s.Stream.acquireSendWindowUpTo(channelID, want)
+		if err != nil {
+			return err
+		}
+		if err := s.writeChannelData(msgType, channelID, data[:g]); err != nil {
+			return err
+		}
+		data = data[g:]
 	}
-	return s.writeChannelData(msgType, channelID, data)
+	return nil
 }
 
 // IsClientChannelID reports whether id belongs to the client-initiated

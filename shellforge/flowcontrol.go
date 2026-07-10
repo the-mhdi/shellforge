@@ -194,29 +194,77 @@ func (s *stream) acquireSendWindow(id uint32, n int) error {
 	return nil
 }
 
-// grantSendWindow is invoked from the read loop when a WindowAdjust arrives. It
-// is intentionally trivial and non-blocking so the reader never stalls.
 func (s *stream) grantSendWindow(id uint32, n uint32) {
 	f := s.getFlow(id)
 	f.mu.Lock()
 	f.sendWindow += int64(n)
+	if f.sendWindow > int64(INITIAL_WINDOW) {
+		// More credit than the peer's ring can hold: an over-grant here would
+		// let us overflow their ring and get the channel killed. Clamp + log.
+		log.Printf("[flow] channel %d: send window over-grant clamped (%d)", id, f.sendWindow)
+		f.sendWindow = int64(INITIAL_WINDOW)
+	}
 	f.cond.Broadcast()
 	f.mu.Unlock()
 }
 
-// returnRecvWindow is called by a consumer AFTER it has drained n bytes out of
-// the receive ring (PipeStream.Read, or a sink-drain goroutine). It batches the
-// credit and, once the threshold is crossed, emits a WindowAdjust so the peer
-// may resume sending. Runs in the consumer goroutine, never the read loop.
-func (s *stream) returnRecvWindow(id uint32, n int) error {
+// acquireSendWindowUpTo blocks the calling goroutine until at least ONE send
+// credit is available, then consumes up to n of them and returns how many it
+// got. Partial grants let the sender transmit min(window, len) immediately,
+// like OpenSSH, instead of parking with sendable data until a big adjust
+// arrives.
+func (s *stream) acquireSendWindowUpTo(id uint32, n int) (int, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	if s.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	f := s.getFlow(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for f.sendWindow == 0 && !f.closed {
+		//log.Println("grentXXXXXXX")
+		f.cond.Wait()
+	}
+	if f.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	g := int64(n)
+	if g > f.sendWindow {
+		g = f.sendWindow
+	}
+	f.sendWindow -= g
+	return int(g), nil
+}
+
+// returnRecvWindow credits the peer for n bytes drained from the receive ring.
+// drained reports whether the ring went empty with this read.
+//
+// A WindowAdjust is flushed when EITHER:
+//   - pending >= WINDOW_ADJUST_THRESHOLD  (steady-state streaming), or
+//   - the consumer caught up (ring empty) and pending >= WINDOW_IDLE_FLUSH_MIN.
+//     This returns the sender to a FULL window during the pauses between
+//     bursts. Without it, up to THRESHOLD-1 bytes of credit stagnate after
+//     every burst and the sender starts its next burst with a shrunken window
+//     -> stall mid-burst -> stop-and-go traffic spikes.
+//
+// If the control write fails, the credits are PUT BACK so the next Read
+// retries the flush -- a transient write error must never shrink the peer's
+// window permanently.
+func (s *stream) returnRecvWindow(id uint32, n int, drained bool) error {
 	if n <= 0 {
 		return nil
 	}
 	f := s.getFlow(id)
+
 	f.mu.Lock()
 	f.recvPending += uint32(n)
 	var flush uint32
-	if f.recvPending >= WINDOW_ADJUST_THRESHOLD {
+	if f.recvPending >= WINDOW_ADJUST_THRESHOLD ||
+		(drained && f.recvPending >= WINDOW_IDLE_FLUSH_MIN) {
 		flush = f.recvPending
 		f.recvPending = 0
 	}
@@ -225,8 +273,15 @@ func (s *stream) returnRecvWindow(id uint32, n int) error {
 	if flush == 0 {
 		return nil
 	}
+
 	wa := &WindowAdjust{ChannelID: id, Increment: flush}
-	return s.session.WritePacket(MsgWindowAdjust, wa)
+	if err := s.session.WritePacket(MsgWindowAdjust, wa); err != nil {
+		f.mu.Lock()
+		f.recvPending += flush // restore -- retried on the next Read
+		f.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
