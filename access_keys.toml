@@ -1,0 +1,21 @@
+# ShellForge access keys — lives at /etc/shellforge/access_keys.toml.
+# One [[key]] block per allow-listed public key. Only containers are
+# supported. The daemon flips "active" to false once key_expires_at
+# (year-month-day) has passed; that key's containers are torn down and
+# no new ones can be created until the operator re-enables it.
+
+[[key]]
+active = true
+pubkey = "c161cd235cab272ee9e8e1ad3de0009d31f2da3c8bac927d3148fc6f1dff2e8f"
+key_expires_at = "2027-01-01" # year-month-day; "" or "never" = no expiry
+key_max_containers = 10
+
+dockerfile_path = "/etc/shellforge/"
+
+containers_expires_after = "30m"
+containers_survive_reboot = true
+containers_killed_after_exit = false
+containers_stop_after_exit = false
+containers_memory_limit = "1g"
+containers_cpu_limit = 1.5
+containers_gpu_limit = "0"

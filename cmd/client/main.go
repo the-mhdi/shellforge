@@ -3,16 +3,17 @@ package main
 import (
 	"context"
 	"crypto"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/BurntSushi/toml"
 	"github.com/the-mhdi/shellforge/shellforge" // Replace with your actual module path
 )
 
@@ -40,10 +41,10 @@ import (
 //   3. -D (dynamic/SOCKS5 forwarding) remains a logged TODO stub.
 // =====================================================================
 
-type JSONClientConfig struct {
-	PreferedKeyExAlgo       string `json:"PreferedKeyExAlgo"`
-	PreferedEncyptionCipher string `json:"PreferedEncyptionCipher"`
-	ClientInitMessage       string `json:"ClientInitMessage"`
+type TOMLClientConfig struct {
+	PreferedKeyExAlgo       string `toml:"PreferedKeyExAlgo"`
+	PreferedEncyptionCipher string `toml:"PreferedEncyptionCipher"`
+	ClientInitMessage       string `toml:"ClientInitMessage"`
 }
 
 func main() {
@@ -80,13 +81,12 @@ func main() {
 		waiting()
 	case "make":
 		err = runMakeMode(ctx, args[1:], configOverride)
+		if err != nil {
+			log.Fatal(err)
+		}
 		waiting()
 	default:
 		err = runDefaultMode(ctx, args, configOverride)
-	}
-
-	if err != nil {
-		log.Fatal(err)
 	}
 
 }
@@ -247,7 +247,7 @@ func connectClient(ctx context.Context, hostport, configOverride string) (*shell
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
 		return nil, nil, err
 	}
-	configDir := resolveConfigDir(configOverride)
+	configDir := resolveConfigDir("")
 
 	signers, err := shellforge.LoadKeys(configDir, true)
 
@@ -275,7 +275,7 @@ func getContainers(ctx context.Context, args []string, configOverride string) er
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
 		return err
 	}
-	configDir := resolveConfigDir(configOverride)
+	configDir := resolveConfigDir("")
 	signers, err := shellforge.LoadKeys(configDir, true)
 
 	if err != nil {
@@ -312,6 +312,7 @@ func runMakeMode(ctx context.Context, args []string, configOverride string) erro
 	if err != nil {
 		return err
 	}
+
 	//ctx := context.Background()
 
 	if err := client.ConnectWithNoAuth(ctx); err != nil {
@@ -319,7 +320,7 @@ func runMakeMode(ctx context.Context, args []string, configOverride string) erro
 	}
 	log.Printf("[CLI] Pre-creating %s environment named %s...", envType, requestedName)
 
-	configDir := resolveConfigDir(configOverride)
+	configDir := resolveConfigDir("")
 	signers, err := shellforge.LoadKeys(configDir, true)
 
 	if err != nil {
@@ -354,8 +355,10 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 
 	client, err := newClient(ctx, hostport, configOverride)
 	if err != nil {
+		defer client.Close()
 		return err
 	}
+	defer client.Close()
 	//ctx := context.Background()
 
 	hasForwards := len(localFwds) > 0 || len(remoteFwds) > 0 || dynamicFwd != ""
@@ -367,6 +370,7 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 				return err
 			}
 			if err := client.Connect(ctx, user); err != nil {
+
 				return err
 			}
 			log.Printf("[CLI] Local forward (-L): %s -> %s", local, remote)
@@ -378,8 +382,10 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 				return err
 			}
 			if err := client.Connect(ctx, user); err != nil {
+
 				return err
 			}
+
 			log.Printf("[CLI] Remote forward (-R): %s -> %s", remote, local)
 			if err := client.ForwardRemoteToLocal(remote, local); err != nil {
 				return err
@@ -394,8 +400,11 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 
 	log.Println("[CLI] Launching interactive shell...")
 	if err := client.Connect(ctx, user); err != nil {
+		log.Println(err)
+		defer client.Close()
 		return err
 	}
+	defer client.Close()
 	return client.RequestShell("/bin/bash", user)
 }
 
@@ -505,7 +514,7 @@ func newClient(ctx context.Context, hostport, configOverride string) (*shellforg
 	conf, err := buildConfig(configDir)
 	client := shellforge.NewClient(ctx, hostport, conf)
 	if err != nil {
-		log.Printf("[ERROR] faild to load config file")
+		log.Printf("[ERROR] faild to load config file, %v", err)
 		client = shellforge.NewClient(ctx, hostport, nil)
 	}
 
@@ -513,18 +522,23 @@ func newClient(ctx context.Context, hostport, configOverride string) (*shellforg
 }
 
 // buildConfig builds the ClientConfig with defaults, then applies overrides
-// from <configDir>/config.json if it exists.
+// from <configDir>/config.toml if it exists.
 func buildConfig(configDir string) (*shellforge.ClientConfig, error) {
 	conf := &shellforge.ClientConfig{
 		PreferedKeyExAlgo:       "hybrid-x25519-mlkem768", // Default to high-security PQC
 		PreferedEncyptionCipher: "chacha20-poly1305",
 		ClientInitMessage:       "SHELLFORGE-v0.1.0",
 	}
+	configPath := filepath.Join(configDir, "config.toml")
 
-	jsonPath := configDir
-	if _, err := os.Stat(jsonPath); err == nil {
-		log.Printf("[client] Loading configuration file: %s", jsonPath)
-		jcc, err := loadJSONClientConfig(jsonPath)
+	if strings.Contains(configDir, ".toml") {
+		configPath = configDir
+	}
+
+	_, err := os.Stat(configPath)
+	if err == nil {
+		log.Printf("[client] Loading configuration file: %s", configPath)
+		jcc, err := loadTOMLClientConfig(configPath)
 		if err != nil {
 			return nil, err
 		}
@@ -538,16 +552,19 @@ func buildConfig(configDir string) (*shellforge.ClientConfig, error) {
 			conf.PreferedEncyptionCipher = jcc.PreferedEncyptionCipher
 		}
 	}
+	if err != nil {
+		log.Printf("[client] falied Loading configuration file at: %s, %v\n\r", configPath, err)
+	}
 	return conf, nil
 }
 
-func loadJSONClientConfig(path string) (*JSONClientConfig, error) {
+func loadTOMLClientConfig(path string) (*TOMLClientConfig, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	cfg := &JSONClientConfig{}
-	if err := json.Unmarshal(raw, cfg); err != nil {
+	cfg := &TOMLClientConfig{}
+	if err := toml.Unmarshal(raw, cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil

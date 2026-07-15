@@ -3,7 +3,7 @@
     "active":true,
     "pubkey": ["c161cd235cab272ee9e8e1ad3de0009d31f2da3c8bac927d3148fc6f1dff2e8f"],
     "key_expires_afer":"0",
-     "max_containers": 0,
+    "max_containers": 0,
     "environment" : [
         {
             "type" : "container",

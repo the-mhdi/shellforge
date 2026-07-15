@@ -7,7 +7,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/msteinert/pam"
+	"golang.org/x/crypto/ssh"
 )
 
 // only supports ed25519 and *ECDSA(not implemented)
@@ -39,17 +39,24 @@ func VerifyClientSignature(filepath string, sessionID, signature, presentedPubKe
 		if len(parts) < 2 {
 			continue
 		}
+		//comment, options, rest,
+		Found_pubKey, _, _, _, err := ssh.ParseAuthorizedKey(scanner.Bytes())
 
-		pubKeyBytes, err := hex.DecodeString(parts[1])
 		if err != nil {
-			log.Printf("[auth] skipping malformed authorized_keys line: invalid hex: %v", err)
+			log.Printf("[auth] skipping malformed authorized_keys line: invalid: %v", err)
 			continue
 		}
-		if len(pubKeyBytes) != 32 {
-			log.Printf("[auth] skipping authorized_keys line with invalid key size: %d", len(pubKeyBytes))
+		Found_pubKeyBytes := Found_pubKey.Marshal()
+
+		SSH_presentedPubKey, err := ssh.NewPublicKey(ed25519.PublicKey(presentedPubKey))
+		if err != nil {
+			log.Printf("[auth] presented key invalid: %v", err)
 			continue
 		}
-		if !bytes.Equal(presentedPubKey, pubKeyBytes) {
+		SSH_presentedPubKey_bytes := SSH_presentedPubKey.Marshal()
+
+		if !bytes.Equal(SSH_presentedPubKey_bytes, Found_pubKeyBytes) {
+			log.Printf("[auth] skipping authorized_keys line presented key not egual with the key server found \n")
 			continue // check the NEXT authorized key
 		}
 
@@ -58,17 +65,6 @@ func VerifyClientSignature(filepath string, sessionID, signature, presentedPubKe
 			return false, fmt.Errorf("[auth] signature verification failed for authorized key")
 		}
 		return true, nil
-
-		/*if strings.ToLower(pkType) == "ecdsa" {
-			//only support compressed
-			if len(pubKeyBytes) < 33 && len(pubKeyBytes) > 67 {
-				return false, fmt.Errorf("invalid key size: %d", len(pubKeyBytes))
-			}
-			hash := sha256.Sum256(sessionID)
-			ecdsa.PublicKey
-			ecdsa.VerifyASN1(presentedPubKey, hash, signature)
-		}
-		*/
 
 	}
 

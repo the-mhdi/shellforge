@@ -558,7 +558,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 			Client_Share_key:  shareKey,
 		}
 
-	} else {
+	} /*else {
 		// --- RESUMING CONNECTION ---
 		log.Printf("[Log] Resuming Client Session With ID: %x, Trying to Craft a New Client Hello Resume and RESUMPTION PROOF", c.session.ID)
 		c.mu.RLock()
@@ -568,7 +568,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 		cHello.EncryptionSupport = true
 
-	}
+	}*/
 
 	if err := tempSession.WritePacket(MsgClientHello, cHello); err != nil {
 		return err
@@ -726,6 +726,17 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 		// ==========================================
 		// PHASE 3.5: CLIENT AUTHENTICATION
 		// ==========================================
+		if c.DaemonAuths&AuthMethodPublicKey != 0 {
+			log.Println("[AUTH] Server supports public key authentication")
+		}
+
+		if c.DaemonAuths&AuthMethodPassword != 0 {
+			log.Println("[AUTH] Server supports password authentication")
+		}
+
+		if c.DaemonAuths&AuthMethodPKI != 0 {
+			log.Println("[AUTH] Server supports PKI authentication")
+		}
 
 		serverAuths := c.DaemonAuths
 		//var aRes *AuthResponse
@@ -746,11 +757,13 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 				}
 
 				for _, key := range c.conf.PrivateKeys {
-					if _, ok := key.(*ed25519.PrivateKey); ok {
+					if _, ok := key.(ed25519.PrivateKey); ok {
 						log.Println("[Log] Executing Cryptographic Public Key Authentication...")
 						publicKey := key.Public().(ed25519.PublicKey)
+						if err != nil {
+							return err
+						}
 
-						// Sign the unique Session ID!
 						signature := ed25519.Sign(key.(ed25519.PrivateKey), c.session.ID)
 
 						PubAuthReq := &PubAuthRequest{
@@ -763,12 +776,16 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 						log.Printf("Client sent public key authentication request for user: %s", username)
 
 						pkt, err := c.session.ReadPacket()
-						if pkt.Payload[0] != MsgServerAuthResponse {
-							return fmt.Errorf("unexpected message type from server during authentication expected: %d, got %d", MsgServerAuthResponse, pkt.Payload[0])
-						}
-
 						if err != nil {
 							return fmt.Errorf("failed to read authentication response: %w", err)
+						}
+
+						if pkt.Payload[0] == MsgServerAuthFailed {
+							return fmt.Errorf("[AUTH] Authentication failed, disconnecting...")
+						}
+
+						if pkt.Payload[0] != MsgServerAuthResponse {
+							return fmt.Errorf("unexpected message type from server during authentication expected: %d, got %d", MsgServerAuthResponse, pkt.Payload[0])
 						}
 
 						ar, err := ParseAuthResponse(pkt.Payload[1:])
@@ -917,15 +934,14 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 	go c.eventLoop()
 
-	log.Printf("[Log] Client Event Loop Started, Server Address: [%s]", c.DaemonAddr)
-
 	return nil
 }
 
 // eventLoop runs in the background and handles all incoming encrypted messages.
 func (c *Client) eventLoop() {
+	log.Printf("[Log] Client Event Loop Started, Server Address: [%s]", c.DaemonAddr)
 	defer log.Printf("Client Event Loop Exited\r\n")
-	defer c.session.Close()
+	defer c.Close()
 	defer c.cancel()
 
 	for {
@@ -945,7 +961,7 @@ func (c *Client) eventLoop() {
 					log.Printf("[Success] Server is now listening on public port: %s", res.Address)
 				} else {
 					log.Printf("[Error] Server failed to open public port: %s", res.Address)
-					c.session.Close()
+					c.Close()
 					return
 				}
 			}
@@ -959,11 +975,14 @@ func (c *Client) eventLoop() {
 			// prefix. false => never close os.Stdout when the channel ends.
 			Channel, k := c.session.NewChannelWithID(ch.ChannelID, false)
 			if k {
-				err := Channel.AttachWriter(os.Stdin)
+				err := Channel.AttachWriter(os.Stdout)
 				if err != nil {
 					log.Printf("[Error] failed to open log channel: %v", err)
 					continue
 				}
+			} else {
+				log.Printf("[Error] failed to open log channel")
+				continue
 			}
 			log.Printf("Server Log channel Opened, %d", ch.ChannelID)
 
@@ -1238,6 +1257,7 @@ func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr strin
 }
 
 func (c *Client) Close() error {
+	c.session.Close()
 	return nil
 }
 

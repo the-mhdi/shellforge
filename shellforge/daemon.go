@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -61,9 +62,9 @@ type DaemonConfig struct {
 	MaxConnectionsAllowed           uint32
 	MaxContainersConnectionsAllowed uint32
 
-	EnvironmentsJsonConfig string
-	DatabaseDir            string
-	ClientInitHandler      func(ctx context.Context, msg []byte) bool
+	//EnvironmentsJsonConfig string
+	DatabaseDir       string
+	ClientInitHandler func(ctx context.Context, msg []byte) bool
 
 	HostKeyPath string // defaults to /etc/shellforge/host_ed25519 if empty
 }
@@ -327,6 +328,7 @@ func (d *Daemon) listen() {
 				log.Println("auth packet received")
 				AuthRes, err := d.shellAuth(session, pkt)
 				if err != nil && i < MAX_AUTH_RETRY {
+					session.WritePacket(MsgServerAuthFailed, nil)
 					continue
 				}
 
@@ -389,16 +391,16 @@ func (d *Daemon) listen() {
 				return
 			}
 
-			pubKeyHex := hex.EncodeToString(eReq.PublicKey)
+			//pubKeyHex := hex.EncodeToString(eReq.PublicKey)
 
-			if !d.DB.HasActiveEnv(pubKeyHex, "container") || !d.DB.IsEligibleKey(pubKeyHex) {
-				log.Printf("no container fot this key %s", pubKeyHex)
+			if !d.DB.HasActiveEnv(eReq.PublicKey, "container") || !d.DB.IsEligibleKey(eReq.PublicKey) {
+				log.Printf("no container fot this key %s", hex.EncodeToString(eReq.PublicKey))
 				session.WritePacket(MsgServerNoContainer, nil)
 				return
 			}
 
 			if eReq.UserRequestedName == nil || eReq.UserRequestedNameLen == 0 {
-				envs, err := d.DB.GetEnvsByType(pubKeyHex, "container")
+				envs, err := d.DB.GetEnvsByType(eReq.PublicKey, "container")
 				if err != nil {
 					log.Printf("cant get container list, %v", err)
 					session.WritePacket(MsgServerNoContainer, nil)
@@ -561,6 +563,13 @@ func (d *Daemon) HandShake(session *Session, cHello *ClientHello) (encrypter, de
 }
 
 func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
+	if d.idleTimeout != 0 {
+		session.SetDeadline(time.Now().Add(d.idleTimeout))
+	} else {
+		//clear hanbdsjake time out if idel time out is 0 , session no longer has a deadline
+		session.SetDeadline(time.Time{})
+	}
+
 	log.Printf("container loop running")
 	d.State.ContainerConns.Add(1)
 	defer d.State.ContainerConns.Sub(1)
@@ -575,11 +584,54 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			break
 		}
 
-		if d.idleTimeout != 0 {
-			session.SetDeadline(time.Now().Add(d.idleTimeout))
-		}
-
 		switch pkt.Payload[0] {
+		case MsgClientChanneledData:
+			// CLIENT WRITING DATA BACK TO PUBLIC USER
+			ch, err := ParseChannelData(pkt.Payload[1:])
+			if err != nil {
+				log.Println("Malformed Channel Data from client")
+				go session.WritePacket(MsgServerChanDataMalformed, nil)
+				continue
+			}
+
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			if chann, ok := session.Stream.getActiveChannel(ch.ChannelID); ok {
+				_, err := chann.Feed(ch.Data)
+				if err != nil {
+					log.Println(err)
+					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
+					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
+					chann.Close()
+
+				}
+			} else {
+				session.WritePacket(MsgServerChannelUnknownOrClosed,
+					&ChannelClosed{ChannelID: ch.ChannelID})
+				//return nil
+				log.Printf("Received Data with unknown Channel ID")
+				continue
+				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
+			}
+
+		case MsgWindowAdjust:
+			wa, err := ParseWindowAdjust(pkt.Payload[1:])
+			if err != nil {
+				log.Printf("malformed WindowAdjust")
+				continue
+			}
+			session.Stream.grantSendWindow(wa.ChannelID, wa.Increment)
+		case MsgClientChannelOpenConfirm:
+
+			confirm, err := ParseClientChannelOpenConfirm(pkt.Payload[1:])
+
+			if err != nil {
+				log.Printf("Malformed Channel Open Confirmation from client")
+				continue
+			}
+
+			if confirm.Success {
+				session.Stream.OpenComfirmed(confirm.ChannelID)
+			}
 		case MsgClientGetContainerShell:
 			cop, err := ParseContainerOpRequest(pkt.Payload[1:])
 			if err != nil {
@@ -596,13 +648,13 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				session.WritePacket(MsgServerInvalidSignature, nil)
 				return
 			}
-			pubKeyHex := hex.EncodeToString(cop.PublicKey)
+			//pubKeyHex := hex.EncodeToString(cop.PublicKey)
 			// 2. Daemon is authoritative! It assigns the Channel ID safely.
 			chanID, Channel := session.NewChannel(true)
 
 			log.Printf("New Channel Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
 
-			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), cop.PublicKey)
 
 			if err != nil {
 				log.Println(err)
@@ -661,13 +713,13 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				session.WritePacket(MsgServerInvalidSignature, nil)
 				return
 			}
-			pubKeyHex := hex.EncodeToString(cop.PublicKey)
-			log.Printf("[container] log Request for container [%s] by [%s]- Req id %v", string(cop.Name), pubKeyHex, cop.RequestID)
+			//pubKeyHex := hex.EncodeToString(cop.PublicKey)
+			log.Printf("[container] log Request for container [%s] by [%s]- Req id %v", string(cop.Name), hex.EncodeToString(cop.PublicKey), cop.RequestID)
 
 			chanID, Channel := session.NewChannel(true)
 
 			log.Printf("New Channel Created by the Daemon - Chan ID = %v", hex.EncodeToString([]byte{byte(chanID)}))
-			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), cop.PublicKey)
 			if err != nil {
 				log.Println(err)
 				continue
@@ -732,12 +784,12 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 				return
 			}
 
-			pubKeyHex := hex.EncodeToString(cop.PublicKey)
-			log.Printf("[container] command exec Request for container [%s] by [%s]- Req id %v", string(cop.Name), pubKeyHex, cop.RequestID)
+			//pubKeyHex :=
+			log.Printf("[container] command exec Request for container [%s] by [%s]- Req id %v", string(cop.Name), hex.EncodeToString(cop.PublicKey), cop.RequestID)
 
 			// 2. Daemon is authoritative! It assigns the Channel ID safely.
 
-			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), pubKeyHex)
+			env, err := d.DB.GetENVByUserReqestedName(string(cop.Name), cop.PublicKey)
 
 			if err != nil {
 				log.Println(err)
@@ -785,59 +837,6 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 					log.Println(err)
 				}
 			}()
-		case MsgClientChanneledData:
-			// CLIENT WRITING DATA BACK TO PUBLIC USER
-			ch, err := ParseChannelData(pkt.Payload[1:])
-			if err != nil {
-				log.Println("Malformed Channel Data from client")
-				go session.WritePacket(MsgServerChanDataMalformed, nil)
-				continue
-			}
-
-			log.Printf("Data received on Channel %d", ch.ChannelID)
-			if chann, ok := session.Stream.getActiveChannel(ch.ChannelID); ok {
-				_, err := chann.Feed(ch.Data)
-				if err != nil {
-					log.Println(err)
-					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
-					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
-					chann.Close()
-
-				}
-			} else {
-				session.WritePacket(MsgServerChannelUnknownOrClosed,
-					&ChannelClosed{ChannelID: ch.ChannelID})
-				//return nil
-				log.Printf("Received Data with unknown Channel ID")
-				continue
-				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
-			}
-		//	err = session.Stream.Feed(pkt.Payload[1:])
-		//	if err != nil {
-
-		// Flow-control violation or closed pipe: drop the channel,
-		// never block the shared reader.
-		//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
-		//		session.CloseActiveChannel(ch.ChannelID)
-		//		session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
-		//	}
-		// Look up the session and ch id and write the data
-		//if c, exists := session.GetActiveChannel(ch.ChannelID); exists {
-		//	if p, ok := c.(*PipeStream); ok {
-		//		if _, err := p.Feed(ch.Data); err != nil {
-		// Flow-control violation or closed pipe: drop the channel,
-		// never block the shared reader.
-		//			log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
-		//			session.CloseActiveChannel(ch.ChannelID)
-		//			session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
-		//		}
-		//	} else {
-		//		log.Println("Unknown channel type in memory!")
-		//	}
-		//} else {
-		//	log.Printf("Received Data with unknown Channel ID: %d", ch.ChannelID)
-		//	session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
-		//}
 
 		case MsgClientSessionClosed:
 			log.Printf("MsgClientSessionClosed")
@@ -871,25 +870,9 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 			if err != nil {
 				log.Printf("initial window resize failed %v ", err)
 			}
-
-		case MsgWindowAdjust:
-			wa, err := ParseWindowAdjust(pkt.Payload[1:])
-			if err != nil {
-				log.Printf("malformed WindowAdjust")
-				continue
-			}
-			session.Stream.grantSendWindow(wa.ChannelID, wa.Increment)
-		case MsgClientChannelOpenConfirm:
-
-			confirm, err := ParseClientChannelOpenConfirm(pkt.Payload[1:])
-
-			if err != nil {
-				log.Printf("Malformed Channel Open Confirmation from client")
-				continue
-			}
-
-			if confirm.Success {
-				session.Stream.OpenComfirmed(confirm.ChannelID)
+		case MsgClientKeepAlive:
+			if d.idleTimeout != 0 {
+				session.SetDeadline(time.Now().Add(d.idleTimeout))
 			}
 		default:
 			log.Printf("Unknown or corrupted message type: %d", pkt.Payload[0])
@@ -898,6 +881,13 @@ func (d *Daemon) ContainerLoop(ctx context.Context, session *Session) {
 	}
 }
 func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
+	if d.idleTimeout != 0 {
+		session.SetDeadline(time.Now().Add(d.idleTimeout))
+	} else {
+		//clear hanbdsjake time out if idel time out is 0 , session no longer has a deadline
+		session.SetDeadline(time.Time{})
+	}
+
 	for {
 
 		pkt, err := session.ReadPacket()
@@ -908,11 +898,55 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			break
 		}
 
-		if d.idleTimeout != 0 {
-			session.SetDeadline(time.Now().Add(d.idleTimeout))
-		}
 		switch pkt.Payload[0] {
+		case MsgClientChanneledData:
+			// CLIENT WRITING DATA BACK TO PUBLIC USER
 
+			ch, err := ParseChannelData(pkt.Payload[1:])
+			if err != nil {
+				log.Println("Malformed Channel Data from client")
+				go session.WritePacket(MsgServerChanDataMalformed, nil)
+				continue
+
+			}
+			if chann, ok := session.Stream.getActiveChannel(ch.ChannelID); ok {
+				_, err := chann.Feed(ch.Data)
+				if err != nil {
+					log.Println(err)
+					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
+					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
+					chann.Close()
+
+				}
+			} else {
+				log.Printf("Received Data with unknown Channel ID")
+				continue
+				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
+			}
+
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			// Look up the session and ch id and write the data
+			//log.Printf("Data received on Channel %d", ch.ChannelID)
+			//err = session.Stream.Feed(pkt.Payload[1:])
+			//log.Println("feedinggg")
+			//if err != nil {
+
+			// Flow-control violation or closed pipe: drop the channel,
+			// never block the shared reader.
+			//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
+			//		session.CloseActiveChannel(ch.ChannelID)
+			//	session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
+			//}
+		case MsgWindowAdjust:
+			wa, err := ParseWindowAdjust(pkt.Payload[1:])
+			if err != nil {
+				log.Printf("malformed WindowAdjust")
+				continue
+			}
+			//log.Printf("packet WindowAdjust recieved on channel %d", wa.ChannelID)
+			session.Stream.grantSendWindow(wa.ChannelID, wa.Increment)
+
+			//go log.Println(session.Stream.getFlow(wa.ChannelID).sendWindow)
 		case MsgClientListenRequest:
 			// Handle client's request to listen on a local port and forward to a destination
 			// This will involve parsing the payload for the requested local port and target destination,
@@ -994,44 +1028,9 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			}
 
 			go ln.Run()
-
+			session.listeners = append(session.listeners, ln)
+			//ln.Close()
 			log.Printf("Spawned listener for client on %s", ln.Address)
-
-		case MsgClientChanneledData:
-			// CLIENT WRITING DATA BACK TO PUBLIC USER
-			ch, err := ParseChannelData(pkt.Payload[1:])
-			if err != nil {
-				log.Println("Malformed Channel Data from client")
-				go session.WritePacket(MsgServerChanDataMalformed, nil)
-				continue
-			}
-			if chann, ok := session.Stream.getActiveChannel(ch.ChannelID); ok {
-				_, err := chann.Feed(ch.Data)
-				if err != nil {
-					log.Println(err)
-					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
-					session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
-					chann.Close()
-
-				}
-			} else {
-				log.Printf("Received Data with unknown Channel ID")
-				continue
-				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
-			}
-			//log.Printf("Data received on Channel %d", ch.ChannelID)
-			// Look up the session and ch id and write the data
-			//log.Printf("Data received on Channel %d", ch.ChannelID)
-			//err = session.Stream.Feed(pkt.Payload[1:])
-			//log.Println("feedinggg")
-			//if err != nil {
-
-			// Flow-control violation or closed pipe: drop the channel,
-			// never block the shared reader.
-			//log.Printf("channel %d feed failed: %v; closing", ch.ChannelID, err)
-			//		session.CloseActiveChannel(ch.ChannelID)
-			//	session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: ch.ChannelID}))
-			//}
 
 		case MsgClientShellRequest:
 			// 1. Parse the specific shell request
@@ -1193,7 +1192,9 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			}(cco.ChannelID, localTarget)
 
 		case MsgClientKeepAlive:
-			// Handle keep-alive messages
+			if d.idleTimeout != 0 {
+				session.SetDeadline(time.Now().Add(d.idleTimeout))
+			}
 		//case MsgChanIDRenegotiationRequest:
 		case MsgClientChannelClosed:
 			ccl, err := ParseChannelClosed(pkt.Payload[1:])
@@ -1246,14 +1247,6 @@ func (d *Daemon) shellLoop(ctx context.Context, session *Session) {
 			if err != nil {
 				log.Printf("initial window resize failed %v ", err)
 			}
-		case MsgWindowAdjust:
-			wa, err := ParseWindowAdjust(pkt.Payload[1:])
-			if err != nil {
-				log.Printf("malformed WindowAdjust")
-				continue
-			}
-			//log.Printf("packet WindowAdjust recieved on channel %d", wa.ChannelID)
-			session.Stream.grantSendWindow(wa.ChannelID, wa.Increment)
 
 		default:
 			log.Printf("Unknown or corrupted message type: %d", pkt.Payload[0])
@@ -1535,30 +1528,14 @@ func (d *Daemon) shellAuth(session *Session, aPkt *PacketFrame) (*AuthResponse, 
 func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID string, eReq *EnvRequest) (*ENVs, error) {
 
 	// Look up the public key in our database
-	pubKeyHex := hex.EncodeToString(eReq.PublicKey)
+	//pubKeyHex := hex.EncodeToString(eReq.PublicKey)
+	//pubk := ed25519.PublicKey(eReq.PublicKey)
+	publicKeyString := base64.URLEncoding.EncodeToString(eReq.PublicKey)
 
-	log.Printf("%s asking for a %s", pubKeyHex, string(eReq.AccessType))
+	log.Printf("%s asking for a %s", publicKeyString, string(eReq.AccessType))
+	//base64.RawStdEncoding.Decode()
 
-	if !d.DB.IsEligibleKey(pubKeyHex) {
-		return nil, ErrNonEligibleKey
-	}
-
-	// Cryptographically verify ownership of the private key
-	if !ed25519.Verify(eReq.PublicKey, []byte(sessionID), eReq.Signature) {
-		return nil, ErrInvalidSignature
-	}
-
-	record, err := d.DB.GetRecord(pubKeyHex)
-	if err != nil {
-		log.Printf("Database error retrieving key: %v", err)
-		return nil, ErrDBKeyRetrival
-	}
-	if record == nil {
-		log.Printf("Database error retrieving key, nil record: %v", err)
-		return nil, ErrDBKeyRetrival
-	}
-
-	envConfig, err := d.ValidateENVRequest(eReq, record)
+	record, envConfig, err := d.ValidateENVRequest(eReq, sessionID)
 
 	if err != nil {
 		log.Printf("NOT A VALID ENV REQ: %v", err)
@@ -1568,69 +1545,64 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 	requestedType := strings.ToLower(strings.TrimSpace(string(eReq.AccessType)))
 
 	switch requestedType {
-	case "system-user":
-		/*
-			//IM_TO_DO: sever should have a type of message that when is recieved by client the client is
-			// asked to type a string(passwd) or sth and that would be sent to the server
-			if SysUserExists(string(eReq.UserRequestedName)) {
-				return nil, errors.New("user already exists. Skipping creation.")
-			}
-			tempUser := GenerateTempUsername()
-			err = CreateSystemUser(tempUser, envConfig.Setting.GroupName, envConfig.Setting.Shell)
-			if err != nil {
-				log.Printf("Failed to create Ephemeral system user: %v", err)
-				//session.WritePacket(MsgServerFailedToCreateTempSysUser, nil)
-				return nil, err
-			}
-			log.Printf("Successfully created Ephemeral system User: %s", tempUser)
-			var expiresAt time.Time
-			duration, err := parseDurationWithDays(envConfig.LifeSpan)
+	/*case "system-user":
 
-			if err != nil {
-				DeleteSystemUser(tempUser)
-				return nil, err
-			}
+	//IM_TO_DO: sever should have a type of message that when is recieved by client the client is
+	// asked to type a string(passwd) or sth and that would be sent to the server
+	if SysUserExists(string(eReq.UserRequestedName)) {
+		return nil, errors.New("user already exists. Skipping creation.")
+	}
+	tempUser := GenerateTempUsername()
+	err = CreateSystemUser(tempUser, envConfig.Setting.GroupName, envConfig.Setting.Shell)
+	if err != nil {
+		log.Printf("Failed to create Ephemeral system user: %v", err)
+		//session.WritePacket(MsgServerFailedToCreateTempSysUser, nil)
+		return nil, err
+	}
+	log.Printf("Successfully created Ephemeral system User: %s", tempUser)
+	var expiresAt time.Time
+	duration, err := parseDurationWithDays(envConfig.LifeSpan)
 
-			if duration > 0 {
-				expiresAt = time.Now().Add(duration)
-			}
+	if err != nil {
+		DeleteSystemUser(tempUser)
+		return nil, err
+	}
 
-			// ====================================================
-			// WRITE TO DB: Track the active container environment! [1, 3]
-			// ====================================================
-			activeEnv := &ENVs{
-				PubKey:            pubKeyHex,
-				EnvType:           "system-user",
-				Name:              tempUser,
-				ImageName:         "",
-				UserRequestedName: string(eReq.UserRequestedName),
-				Setting:           envConfig.Setting, // COPY THE SETTINGS DIRECTLY! [1]
-				ExpiresAt:         expiresAt,
-				CreatedAt:         time.Now(),
-				SurviveReboot:     envConfig.Setting.SurviveReboot,
-			}
+	if duration > 0 {
+		expiresAt = time.Now().Add(duration)
+	}
 
-			err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
-			if err != nil {
-				DeleteSystemUser(tempUser)
-				return nil, err
-			}
+	// ====================================================
+	// WRITE TO DB: Track the active container environment! [1, 3]
+	// ====================================================
+	activeEnv := &ENVs{
+		PubKey:            pubKeyHex,
+		EnvType:           "system-user",
+		Name:              tempUser,
+		ImageName:         "",
+		UserRequestedName: string(eReq.UserRequestedName),
+		Setting:           envConfig.Setting, // COPY THE SETTINGS DIRECTLY! [1]
+		ExpiresAt:         expiresAt,
+		CreatedAt:         time.Now(),
+		SurviveReboot:     envConfig.Setting.SurviveReboot,
+	}
 
-			return activeEnv, nil
-			//session.WritePacket(MsgServerTempShellResponse)
-		*/
+	err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
+	if err != nil {
+		DeleteSystemUser(tempUser)
+		return nil, err
+	}
+
+	return activeEnv, nil
+	//session.WritePacket(MsgServerTempShellResponse)
+	*/
 	case "container": //use libcontainer, https://github.com/opencontainers/runc/tree/main/libcontainer
 
-		if record.MaxContainers > 0 && record.ContaintersCount >= record.MaxContainers {
-			log.Printf("Key has reached maximum container creations: %s", pubKeyHex)
-
-			return nil, errors.New("maximum container creations reached")
-		}
 		var imageName string
 		var containerName string
 		if envConfig.Setting.DockerfilePath != "" {
 
-			imageName, err = BuildDockerfileOnDemand(ctx, p, envConfig.Setting.DockerfilePath, pubKeyHex)
+			imageName, err = BuildDockerfileOnDemand(ctx, p, envConfig.Setting.DockerfilePath, publicKeyString)
 			if err != nil {
 				log.Printf("Failed to compile custom Dockerfile: %v", err)
 				return nil, err
@@ -1639,7 +1611,7 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 
 		log.Printf("image built: %s", imageName)
 
-		containerName, err = CreateContainer(ctx, p, pubKeyHex, imageName, envConfig.Setting.MemoryLimit, envConfig.Setting.CPULimit, envConfig.Setting.GPULimit)
+		containerName, err = CreateContainer(ctx, p, publicKeyString, imageName, envConfig.Setting.MemoryLimit, envConfig.Setting.CPULimit, envConfig.Setting.GPULimit)
 		if err != nil {
 			if containerName != "" {
 				KillAndRemoveContainer(ctx, containerName)
@@ -1654,7 +1626,7 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 
 		// Calculate absolute expiration time
 		var expiresAt time.Time
-		duration, err := parseDurationWithDays(record.ExpiresAfter.String())
+		duration, err := parseDurationWithDays(record.ContainersExpireAfter)
 
 		if err != nil {
 			KillAndRemoveContainer(ctx, containerName)
@@ -1670,7 +1642,7 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 		// WRITE TO DB: Track the active container environment! [1, 3]
 		// ====================================================
 		activeEnv := &ENVs{
-			PubKey:            pubKeyHex,
+			PubKey:            record.PubKey,
 			EnvType:           "container",
 			Name:              containerName,
 			ImageName:         imageName,
@@ -1692,7 +1664,7 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 				"  ExpiresAt:%s"+
 				"  SurviveReboot: %t\n"+
 				"}\n",
-			pubKeyHex,
+			record.PubKey,
 			containerName,
 			imageName,
 			string(eReq.UserRequestedName),
@@ -1701,7 +1673,7 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 			envConfig.Setting.SurviveReboot,
 		)
 
-		err = d.DB.AddENV(activeEnv) // Track in SQLite [1]
+		err = d.DB.AddENV(activeEnv)
 		if err != nil {
 			if err == ErrDuplicateEnvName {
 				return nil, err
@@ -1712,72 +1684,72 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 		}
 		return activeEnv, nil
 
-	case "hostsharednamespace", "jailed", "namespace", "host-shared":
+	//case "hostsharednamespace", "jailed", "namespace", "host-shared":
 	default:
 		return nil, errors.New("invaild env type ")
 	}
 	//d.DB.updateField("allowed_keys", string(tsReq.PublicKey), "created_users", record.CreatedUsers+1)
 
-	return nil, nil
+	//return nil, nil
 }
 
 // ValidateTempShellRequest performs cryptographic, stateful, and resource-limit
 // validations on the incoming Client request against the SQLite database [1, 2].
-func (d *Daemon) ValidateENVRequest(eReq *EnvRequest, record *AccessKeyRecord) (*EnvConfig, error) {
+func (d *Daemon) ValidateENVRequest(eReq *EnvRequest, sessionID string) (*AccessKeyRecord, *EnvConfig, error) {
 	if eReq == nil {
-		return nil, fmt.Errorf("nil temporary shell request")
+		return nil, nil, fmt.Errorf("nil temporary shell request")
+	}
+	if !d.DB.IsEligibleKey(eReq.PublicKey) {
+		return nil, nil, ErrNonEligibleKey
+	}
+
+	// Cryptographically verify ownership of the private key
+	if !ed25519.Verify(eReq.PublicKey, []byte(sessionID), eReq.Signature) {
+		return nil, nil, ErrInvalidSignature
+	}
+
+	record, err := d.DB.GetRecord(eReq.PublicKey)
+	if err != nil {
+		log.Printf("Database error retrieving key: %v", err)
+		return nil, nil, ErrDBKeyRetrival
+	}
+	if record == nil {
+		log.Printf("Database error retrieving key, nil record: %v", err)
+		return nil, nil, ErrDBKeyRetrival
 	}
 
 	// 3. Verify overall key expiration (survives reboots!) [2]
-	if record.KeyExpiresAfter > 0 {
-		if time.Since(record.CreatedAt) > record.KeyExpiresAfter {
-			return nil, fmt.Errorf("access key has expired (validity period was %v)", record.KeyExpiresAfter)
-		}
+	if record.IsExpired(time.Now()) {
+		return nil, nil, fmt.Errorf("access key expired on %s", record.KeyExpiresAt)
 	}
 
 	if len(eReq.UserRequestedName) > 32 {
-		return nil, fmt.Errorf("requested name is longer than 32 char")
+		return nil, nil, fmt.Errorf("requested name is longer than 32 char")
 	}
 
 	// 4. Normalize the requested AccessType (case-insensitive, trimmed)
 	requestedType := strings.ToLower(strings.TrimSpace(string(eReq.AccessType)))
 
-	// 5. Search the environment config slice for the matching allowed profile [1, 2]
-	var matchedEnv *EnvConfig
-	for _, env := range record.Environment {
-		if strings.ToLower(strings.TrimSpace(env.Type)) == requestedType {
-			matchedEnv = &env
-			break
-		}
+	// 5. Only containers are supported; build the env profile straight
+	// from the flat access key record [1, 2]
+	if requestedType != "container" {
+		return nil, nil, fmt.Errorf("environment type %q is not authorized for this key (only \"container\" is supported)", string(eReq.AccessType))
 	}
-
-	if matchedEnv == nil {
-		return nil, fmt.Errorf("environment type %q is not authorized for this key", string(eReq.AccessType))
+	matchedEnv := &EnvConfig{
+		Type:    "container",
+		Setting: record.ContainerSetting(),
 	}
 
 	// 7. Enforce dynamic resource limit thresholds [2]
-	switch requestedType {
-	/*	case "system-user":
-		if record.MaxUsers > 0 && record.SysUsersCount >= record.MaxUsers {
-			return nil, fmt.Errorf("maximum active system users limit reached (%d/%d)",
-				record.SysUsersCount, record.MaxUsers)
-		}*/
-	case "container":
-		// Preserves your exact "ContaintersCount" struct spelling to prevent compilation errors
-		if record.MaxContainers > 0 && record.ContaintersCount >= record.MaxContainers {
-			return nil, fmt.Errorf("maximum active containers limit reached (%d/%d)",
-				record.ContaintersCount, record.MaxContainers)
+	if record.KeyMaxContainers > 0 {
+		active := d.DB.CountEnvsByType(eReq.PublicKey, "container")
+		if active >= record.KeyMaxContainers {
+			return nil, nil, fmt.Errorf("maximum active containers limit reached (%d/%d)",
+				active, record.KeyMaxContainers)
 		}
-		/*
-			case "hostsharednamespace", "jailed":
-				if record.MaxNamespaces > 0 && record.NamespacesCount >= record.MaxNamespaces {
-					return nil, fmt.Errorf("maximum active jailed environments limit reached (%d/%d)",
-						record.NamespacesCount, record.MaxNamespaces)
-				}
-		*/
 	}
 
-	return matchedEnv, nil
+	return record, matchedEnv, nil
 }
 
 func Start(conf DaemonConfig) {
@@ -1790,18 +1762,10 @@ func Start(conf DaemonConfig) {
 	db, err := OpenDB(dbdir)
 
 	if err != nil {
-		log.Fatalf("Failed to open SQLite database: %v", err)
+		log.Fatalf("Failed to open database: %v", err)
 	}
 
-	log.Printf("database Loaded")
-
-	if conf.EnvironmentsJsonConfig != "" {
-		_, err := db.LoadAccessKeysConf(conf.EnvironmentsJsonConfig)
-		if err != nil {
-			log.Fatalf("Failed to open parse EnvironmentsJsonConfig: %v", err)
-		}
-		log.Printf(" access keys database Loaded")
-	}
+	log.Printf("database Loaded (access keys: %s)", AccessKeysPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &DaemonState{

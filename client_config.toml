@@ -1,0 +1,3 @@
+PreferedKeyExAlgo = ""
+PreferedEncyptionCipher = ""
+ClientInitMessage = "SHELLFORGE-v0.1.0-INIT"

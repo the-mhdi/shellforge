@@ -136,9 +136,7 @@ func (she *Shell) RunInteractiveShell(ctx context.Context, shellReq *ShellReques
 	if err != nil {
 		return err
 	}
-	defer ptyFd.Close()
-
-	defer func() { _ = ptyFd.Close() }() // Best effort.
+	//defer ptyFd.Close()
 
 	// =================================================================
 	// CLEAR SCREEN IMPLEMENTATION
@@ -152,7 +150,8 @@ func (she *Shell) RunInteractiveShell(ctx context.Context, shellReq *ShellReques
 	//sh := newShell(pipe)
 
 	she.SetPTY(ptyFd)
-	defer she.SetPTY(nil) // Clean up on exit
+	defer func() { _ = ptyFd.Close() }() // Best effort.
+	defer she.SetPTY(nil)                // Clean up on exit
 
 	errCh := make(chan error, 2)
 

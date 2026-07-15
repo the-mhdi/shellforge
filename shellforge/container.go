@@ -170,7 +170,7 @@ func BuildDockerfileOnDemand(ctx context.Context, pipe *channel, dockerfilePath,
 	if dockerfilePath == "" {
 		return "", nil
 	}
-	imageName := fmt.Sprintf("%s%s", IMAGE_NAME_PREFIX, pubKeyHex[:8])
+	imageName := fmt.Sprintf("%s%s", IMAGE_NAME_PREFIX, strings.ToLower(pubKeyHex[:8]))
 
 	// 1. FAST PATH: Check if the compiled image already exists in local storage.
 	existsCmd := exec.CommandContext(ctx, "podman", "image", "exists", imageName)
@@ -197,9 +197,9 @@ func BuildDockerfileOnDemand(ctx context.Context, pipe *channel, dockerfilePath,
 // CreatePodmanContainer parses the configuration and pre-stages the container on disk.
 // It uses "podman create" instead of "run" so that the container is registered
 // but remains in a "stopped" state until the user actually logs in [1.2.2].
-func CreateContainer(ctx context.Context, pipe *channel, pubKeyHex, imageName, memoryLimit string, cpuLimit float64, gpuLimit string) (string, error) {
+func CreateContainer(ctx context.Context, pipe *channel, pubKey, imageName, memoryLimit string, cpuLimit float64, gpuLimit string) (string, error) {
 	log.Printf("[Container] running as uid=%d, XDG_RUNTIME_DIR=%s", os.Getuid(), os.Getenv("XDG_RUNTIME_DIR"))
-	containerName := fmt.Sprintf("%s%s", CONTAINER_NAME_PREFIX, pubKeyHex[:8])
+	containerName := fmt.Sprintf("%s%s", CONTAINER_NAME_PREFIX, strings.ToLower(pubKey[:8]))
 
 	// 1. Check if the container already exists on the host [1.2.3]
 	existsCmd := exec.Command("podman", "container", "exists", containerName)

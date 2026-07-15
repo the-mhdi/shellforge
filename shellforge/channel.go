@@ -1,6 +1,13 @@
 package shellforge
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"errors"
+)
+
+var ErrChannelDataTooLarge = errors.New(
+	"channel data frame exceeds MAX_CHANNEL_DATA_LEN: protocol violation",
+)
 
 //every connection from/to the daemon gets a chanID() + every connection from/to the Client gets a chanID()
 //daemon and client has to be aware of the all active channels
@@ -62,24 +69,29 @@ func (p *Channel) Type() uint8 {
 
 func ParseChannelData(data []byte) (*Channel, error) {
 	cd := &Channel{}
-	offset := 0
 
-	if len(data) < offset+4 {
+	if len(data) < 8 {
 		return nil, ErrCanNotParseMalformedPacket
 	}
-	cd.ChannelID = binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
+	cd.ChannelID = binary.BigEndian.Uint32(data[0:4])
+	cd.DataLen = binary.BigEndian.Uint32(data[4:8])
 
-	if len(data) < offset+4 {
+	// Enforce the receive-side frame cap BEFORE the int() conversion and
+	// slicing below:
+	//   - a compliant sender (SendChannelData chunks to MAX_CHANNEL_DATA_LEN)
+	//     never produces a bigger frame, so anything larger is a buggy or
+	//     malicious peer;
+	//   - it also guards the int(DataLen) cast: on 32-bit platforms a huge
+	//     uint32 overflows int to a negative value, which slips past the
+	//     "len(data) < offset+n" bounds check and panics on the slice.
+	if cd.DataLen > MAX_CHANNEL_DATA_LEN {
+		return nil, ErrChannelDataTooLarge
+	}
+
+	if len(data) < 8+int(cd.DataLen) {
 		return nil, ErrCanNotParseMalformedPacket
 	}
-	cd.DataLen = binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-
-	if len(data) < offset+int(cd.DataLen) {
-		return nil, ErrCanNotParseMalformedPacket
-	}
-	cd.Data = data[offset : offset+int(cd.DataLen)] // Zero-Copy!
+	cd.Data = data[8 : 8+cd.DataLen] // Zero-Copy!
 
 	return cd, nil
 }

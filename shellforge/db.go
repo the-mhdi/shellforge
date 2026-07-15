@@ -1,9 +1,10 @@
 package shellforge
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -13,56 +14,101 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"golang.org/x/crypto/ssh"
 )
+
+// AccessKeysPath is the only place access keys are read from. Operators
+// edit this file by hand; it cannot be overridden at runtime.
+const AccessKeysPath = "/etc/shellforge/access_keys.toml"
 
 // =====================================================================
 // CORE TYPES
 // =====================================================================
 
-type EnvConfigSlice []EnvConfig
-
 type EnvConfig struct {
-	Type    string     `json:"type"` // "container" (only supported type for now)
-	Setting EnvSetting `json:"setting"`
+	Type    string     `toml:"type"` // "container" (only supported type for now)
+	Setting EnvSetting `toml:"setting"`
 }
 
 type EnvSetting struct {
 	// Container Configuration
-	DockerfilePath string  `json:"dockerfile_path,omitempty"`
-	MemoryLimit    string  `json:"memory_limit,omitempty"`
-	CPULimit       float64 `json:"cpu_limit,omitempty"`
-	GPULimit       string  `json:"gpu_limit,omitempty"`
-	SurviveReboot  bool    `json:"survive_reboot"`
-	StopAfterExit  bool    `json:"stop_after_exit"`
-	KillAfterExit  bool    `json:"kill_after_exit"`
-	Shell          string  `json:"shell,omitempty"`
+	DockerfilePath string  `toml:"dockerfile_path,omitempty"`
+	MemoryLimit    string  `toml:"memory_limit,omitempty"`
+	CPULimit       float64 `toml:"cpu_limit,omitempty"`
+	GPULimit       string  `toml:"gpu_limit,omitempty"`
+	SurviveReboot  bool    `toml:"survive_reboot"`
+	StopAfterExit  bool    `toml:"stop_after_exit"`
+	KillAfterExit  bool    `toml:"kill_after_exit"`
+	Shell          string  `toml:"shell,omitempty"`
 }
 
-// AccessKeyRecord represents one entry in keys.json (the allow-list config).
+// AccessKeyRecord represents one [[key]] entry in access_keys.toml (the
+// operator-edited allow list). Only containers are supported, so all
+// container settings live flat on the key itself.
 type AccessKeyRecord struct {
-	IsActive         bool           `json:"active"`
-	SurviveReboot    bool           `json:"survive_reboot,omitempty"`
-	PubKeys          []string       `json:"pubkey"`
-	KeyExpiresAfter  time.Duration  `json:"key_expires_afer"` // Nanoseconds in DB
-	Environment      EnvConfigSlice `json:"environment"`
-	MaxContainers    int            `json:"max_containers,omitempty"`
-	ContaintersCount int            `json:"containters_count,omitempty"`
-	CreatedAt        time.Time      `json:"created_at,omitempty"`
-	ExpiresAfter     time.Duration  `json:"expires_after,omitempty"`
+	IsActive         bool   `toml:"active"`
+	PubKey           string `toml:"pubkey"`
+	KeyExpiresAt     string `toml:"key_expires_at"` // "2006-01-02" (year-month-day); "", "0" or "never" = no expiry
+	KeyMaxContainers int    `toml:"key_max_containers"`
+
+	DockerfilePath string `toml:"dockerfile_path"`
+
+	ContainersExpireAfter     string  `toml:"containers_expire_after"`
+	ContainersSurviveReboot   bool    `toml:"containers_survive_reboot"`
+	ContainersKilledAfterExit bool    `toml:"containers_killed_after_exit"`
+	ContainersStopAfterExit   bool    `toml:"containers_stop_after_exit"`
+	ContainersMemoryLimit     string  `toml:"containers_memory_limit"`
+	ContainersCPULimit        float64 `toml:"containers_cpu_limit"`
+	ContainersGPULimit        string  `toml:"containers_gpu_limit"`
 }
 
-// ENVs represents one currently-running/created environment in envs.json.
+// IsExpired reports whether the key is past its key_expires_at date
+// ("2006-01-02", i.e. year-month-day). Empty, "0", or "never" mean the
+// key never expires. The key expires at 00:00 local time on that date.
+// An unparseable date is treated as expired (and logged) so a typo can
+// never silently grant permanent access.
+func (r *AccessKeyRecord) IsExpired(now time.Time) bool {
+	s := strings.TrimSpace(strings.ToLower(r.KeyExpiresAt))
+	if s == "" || s == "0" || s == "never" {
+		return false
+	}
+	t, err := time.ParseInLocation("2006-01-02", s, time.Local)
+	if err != nil {
+		log.Printf("[DB] key %s has invalid key_expires_at %q (want year-month-day): %v",
+			shortKey(r.PubKey), r.KeyExpiresAt, err)
+		return true
+	}
+	return !now.Before(t)
+}
+
+// ContainerSetting maps the flat container fields onto the EnvSetting
+// shape stored per-environment in envs.toml (which stays unchanged).
+func (r *AccessKeyRecord) ContainerSetting() EnvSetting {
+	return EnvSetting{
+		DockerfilePath: r.DockerfilePath,
+		MemoryLimit:    r.ContainersMemoryLimit,
+		CPULimit:       r.ContainersCPULimit,
+		GPULimit:       r.ContainersGPULimit,
+		SurviveReboot:  r.ContainersSurviveReboot,
+		StopAfterExit:  r.ContainersStopAfterExit,
+		KillAfterExit:  r.ContainersKilledAfterExit,
+	}
+}
+
+// ENVs represents one currently-running/created environment in envs.toml.
 type ENVs struct {
-	ID                string     `json:"id"`
-	PubKey            string     `json:"pubkey"`
-	EnvType           string     `json:"env_type"` // "container" (only supported type for now)
-	Name              string     `json:"name"`
-	ImageName         string     `json:"image_name,omitempty"`
-	UserRequestedName string     `json:"user_requested_name,omitempty"`
-	Setting           EnvSetting `json:"setting"`
-	ExpiresAt         time.Time  `json:"expires_at"`
-	CreatedAt         time.Time  `json:"created_at"`
-	SurviveReboot     bool       `json:"survive_reboot,omitempty"`
+	ID                string     `toml:"id"`
+	PubKey            string     `toml:"pubkey"`
+	EnvType           string     `toml:"env_type"` // "container" (only supported type for now)
+	Name              string     `toml:"name"`
+	ImageName         string     `toml:"image_name,omitempty"`
+	UserRequestedName string     `toml:"user_requested_name,omitempty"`
+	Setting           EnvSetting `toml:"setting"`
+	ExpiresAt         time.Time  `toml:"expires_at"`
+	CreatedAt         time.Time  `toml:"created_at"`
+	SurviveReboot     bool       `toml:"survive_reboot,omitempty"`
 }
 
 var (
@@ -70,16 +116,53 @@ var (
 )
 
 // =====================================================================
-// DB — JSON FILE BACKED STORE
+// DB — TOML FILE BACKED STORE
 // =====================================================================
 //
-// Two flat JSON files act as our "tables":
-//   <dir>/keys.json  -> []AccessKeyRecord  (allow-listed keys + their limits)
-//   <dir>/envs.json  -> []ENVs             (actively created environments)
+// Two flat TOML files act as our "tables":
+//   /etc/shellforge/access_keys.toml -> [[key]]   (operator-edited allow list)
+//   <dir>/envs.toml                  -> [[envs]]  (actively created environments)
+//
+// TOML cannot represent a top-level array, so each file wraps its rows
+// in a named array-of-tables ([[key]] / [[envs]]).
 //
 // A single RWMutex guards in-memory state; every mutation is flushed to
 // disk atomically (write to temp file, then rename) so a crash mid-write
-// can never corrupt the JSON.
+// can never corrupt the TOML.
+
+// accessKeysFile / envsFile are the on-disk document shapes.
+type accessKeysFile struct {
+	Keys []AccessKeyRecord `toml:"key"`
+}
+
+type envsFile struct {
+	Envs []ENVs `toml:"envs"`
+}
+
+// accessKeysTemplate seeds access_keys.toml on first start so operators
+// know the expected format.
+const accessKeysTemplate = `# ShellForge access keys.
+# One [[key]] block per allow-listed public key. Only containers are
+# supported. The daemon flips "active" to false once key_expires_at
+# (year-month-day) has passed; that key's containers are torn down and
+# no new ones can be created until the operator re-enables it.
+#
+# [[key]]
+# active = true
+# pubkey = "c161cd235cab272ee9e8e1ad3de0009d31f2da3c8bac927d3148fc6f1dff2e8f"
+# key_expires_at = "2027-01-01" # year-month-day; "" or "never" = no expiry
+# key_max_containers = 10
+#
+# dockerfile_path = "/etc/shellforge/"
+#
+# containers_expire_after = "30m"
+# containers_survive_reboot = true
+# containers_killed_after_exit = false
+# containers_stop_after_exit = false
+# containers_memory_limit = "1g"
+# containers_cpu_limit = 1.5
+# containers_gpu_limit = "0"
+`
 
 type DB struct {
 	mu sync.RWMutex
@@ -92,22 +175,26 @@ type DB struct {
 }
 
 // OpenDB takes a directory path (e.g. "/var/lib/shellforge") and ensures
-// keys.json / envs.json exist inside it, loading them into memory.
+// envs.toml exists inside it, loading it into memory together with the
+// access keys from AccessKeysPath.
 func OpenDB(path string) (*DB, error) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create database directory structure at %s: %w", path, err)
 	}
+	if err := os.MkdirAll(filepath.Dir(AccessKeysPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", filepath.Dir(AccessKeysPath), err)
+	}
 
 	d := &DB{
-		keysPath: filepath.Join(path, "keys.json"),
-		envsPath: filepath.Join(path, "envs.json"),
+		keysPath: AccessKeysPath,
+		envsPath: filepath.Join(path, "envs.toml"),
 	}
 
 	if err := d.loadKeysLocked(); err != nil {
-		return nil, fmt.Errorf("failed to load keys.json: %w", err)
+		return nil, fmt.Errorf("failed to load access_keys.toml: %w", err)
 	}
 	if err := d.loadEnvsLocked(); err != nil {
-		return nil, fmt.Errorf("failed to load envs.json: %w", err)
+		return nil, fmt.Errorf("failed to load envs.toml: %w", err)
 	}
 
 	return d, nil
@@ -123,8 +210,12 @@ func (d *DB) loadKeysLocked() error {
 
 	bytes, err := os.ReadFile(d.keysPath)
 	if errors.Is(err, os.ErrNotExist) {
+		// Seed a commented template so operators know the expected format.
 		d.keys = []AccessKeyRecord{}
-		return d.saveKeysUnlocked()
+		if werr := os.WriteFile(d.keysPath, []byte(accessKeysTemplate), 0644); werr != nil {
+			return fmt.Errorf("failed to create %s: %w", d.keysPath, werr)
+		}
+		return nil
 	}
 	if err != nil {
 		return err
@@ -133,11 +224,14 @@ func (d *DB) loadKeysLocked() error {
 		d.keys = []AccessKeyRecord{}
 		return nil
 	}
-	var keys []AccessKeyRecord
-	if err := json.Unmarshal(bytes, &keys); err != nil {
-		return fmt.Errorf("malformed keys.json: %w", err)
+	var kf accessKeysFile
+	if err := toml.Unmarshal(bytes, &kf); err != nil {
+		return fmt.Errorf("malformed access_keys.toml: %w", err)
 	}
-	d.keys = keys
+	if kf.Keys == nil {
+		kf.Keys = []AccessKeyRecord{}
+	}
+	d.keys = kf.Keys
 	return nil
 }
 
@@ -157,27 +251,37 @@ func (d *DB) loadEnvsLocked() error {
 		d.envs = []ENVs{}
 		return nil
 	}
-	var envs []ENVs
-	if err := json.Unmarshal(bytes, &envs); err != nil {
-		return fmt.Errorf("malformed envs.json: %w", err)
+	var ef envsFile
+	if err := toml.Unmarshal(bytes, &ef); err != nil {
+		return fmt.Errorf("malformed envs.toml: %w", err)
 	}
-	d.envs = envs
+	if ef.Envs == nil {
+		ef.Envs = []ENVs{}
+	}
+	d.envs = ef.Envs
 	return nil
+}
+
+// ReloadAccessKeys re-reads access_keys.toml from disk so hand-edits made
+// by the operator while the daemon is running are picked up. The reaper
+// calls this at the start of every sweep.
+func (d *DB) ReloadAccessKeys() error {
+	return d.loadKeysLocked()
 }
 
 // saveKeysUnlocked / saveEnvsUnlocked assume the caller already holds d.mu.
 func (d *DB) saveKeysUnlocked() error {
-	return atomicWriteJSON(d.keysPath, d.keys)
+	return atomicWriteTOML(d.keysPath, accessKeysFile{Keys: d.keys})
 }
 
 func (d *DB) saveEnvsUnlocked() error {
-	return atomicWriteJSON(d.envsPath, d.envs)
+	return atomicWriteTOML(d.envsPath, envsFile{Envs: d.envs})
 }
 
-func atomicWriteJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
+func atomicWriteTOML(path string, v any) error {
+	b, err := toml.Marshal(v)
 	if err != nil {
-		return fmt.Errorf("failed to marshal JSON for %s: %w", path, err)
+		return fmt.Errorf("failed to marshal TOML for %s: %w", path, err)
 	}
 
 	tmp := path + ".tmp"
@@ -196,39 +300,37 @@ func atomicWriteJSON(path string, v any) error {
 // =====================================================================
 
 // GetRecord retrieves the configuration of a specific allowed public key.
-// Matches against the PubKeys slice on each record.
-func (d *DB) GetRecord(key string) (*AccessKeyRecord, error) {
+func (d *DB) GetRecord(key []byte) (*AccessKeyRecord, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for i := range d.keys {
-		for _, pk := range d.keys[i].PubKeys {
-			if pk == key {
-				rec := d.keys[i] // copy
-				return &rec, nil
-			}
+		if AreEqual(d.keys[i].PubKey, key) == true {
+			rec := d.keys[i] // copy
+			return &rec, nil
 		}
+
 	}
 	return nil, nil
 }
 
-func (d *DB) IsEligibleKey(key string) bool {
+func (d *DB) IsEligibleKey(key []byte) bool {
 	rec, err := d.GetRecord(key)
 	if err != nil {
 		log.Printf("[DB] Failed to check key eligibility: %v", err)
 		return false
 	}
-	return rec != nil && rec.IsActive
+	return rec != nil && rec.IsActive && !rec.IsExpired(time.Now())
 }
 
 // HasActiveEnv checks if there is an active environment of a specific type
 // (e.g. "container") currently running for the given public key.
-func (d *DB) HasActiveEnv(key, envType string) bool {
+func (d *DB) HasActiveEnv(key []byte, envType string) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for _, e := range d.envs {
-		if e.PubKey == key && e.EnvType == envType {
+		if AreEqual(e.PubKey, key) && e.EnvType == envType {
 			log.Printf("confirmed:the key has active env")
 			return true
 		}
@@ -241,13 +343,13 @@ func (d *DB) HasActiveEnv(key, envType string) bool {
 // ENV LOOKUPS
 // =====================================================================
 
-func (d *DB) GetENVByUserReqestedName(name, pubKey string) (*ENVs, error) {
+func (d *DB) GetENVByUserReqestedName(name string, key []byte) (*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for i := range d.envs {
 		e := &d.envs[i]
-		if e.UserRequestedName == name && e.PubKey == pubKey {
+		if e.UserRequestedName == name && AreEqual(e.PubKey, key) {
 			cp := *e
 			return &cp, nil
 		}
@@ -255,13 +357,13 @@ func (d *DB) GetENVByUserReqestedName(name, pubKey string) (*ENVs, error) {
 	return nil, nil
 }
 
-func (d *DB) GetENVByname(name, pubKey string) (*ENVs, error) {
+func (d *DB) GetENVByname(name string, key []byte) (*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for i := range d.envs {
 		e := &d.envs[i]
-		if e.Name == name && e.PubKey == pubKey {
+		if e.Name == name && AreEqual(e.PubKey, key) {
 			cp := *e
 			return &cp, nil
 		}
@@ -270,13 +372,13 @@ func (d *DB) GetENVByname(name, pubKey string) (*ENVs, error) {
 }
 
 // GetENVs retrieves all environments associated with a specific public key.
-func (d *DB) GetENVs(key string) ([]*ENVs, error) {
+func (d *DB) GetENVs(key []byte) ([]*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	var out []*ENVs
 	for i := range d.envs {
-		if d.envs[i].PubKey == key {
+		if AreEqual(d.envs[i].PubKey, key) {
 			cp := d.envs[i]
 			out = append(out, &cp)
 		}
@@ -284,13 +386,13 @@ func (d *DB) GetENVs(key string) ([]*ENVs, error) {
 	return out, nil
 }
 
-func (d *DB) GetEnvsByType(key string, envType string) ([]*ENVs, error) {
+func (d *DB) GetEnvsByType(key []byte, envType string) ([]*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	var out []*ENVs
 	for i := range d.envs {
-		if d.envs[i].PubKey == key && d.envs[i].EnvType == envType {
+		if AreEqual(d.envs[i].PubKey, key) && d.envs[i].EnvType == envType {
 			cp := d.envs[i]
 			out = append(out, &cp)
 		}
@@ -298,13 +400,28 @@ func (d *DB) GetEnvsByType(key string, envType string) ([]*ENVs, error) {
 	return out, nil
 }
 
-func (d *DB) GetEnvByTypeAndName(key, name, envType string) (*ENVs, error) {
+// CountEnvsByType returns how many environments of the given type are
+// currently active for a public key (used to enforce key_max_containers).
+func (d *DB) CountEnvsByType(key []byte, envType string) int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	count := 0
+	for i := range d.envs {
+		if AreEqual(d.envs[i].PubKey, key) && d.envs[i].EnvType == envType {
+			count++
+		}
+	}
+	return count
+}
+
+func (d *DB) GetEnvByTypeAndName(key []byte, name, envType string) (*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for i := range d.envs {
 		e := &d.envs[i]
-		if e.Name == name && e.PubKey == key && e.EnvType == envType {
+		if e.Name == name && AreEqual(e.PubKey, key) && e.EnvType == envType {
 			cp := *e
 			return &cp, nil
 		}
@@ -347,20 +464,15 @@ func (d *DB) AddENV(env *ENVs) error {
 }
 
 // UpdateKeyField safely updates a single field on an AccessKeyRecord,
-// matched by one of its PubKeys, then persists keys.json.
+// matched by its pubkey, then persists access_keys.toml.
 func (d *DB) UpdateKeyField(pubkey, field string, newValue any) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	idx := -1
 	for i := range d.keys {
-		for _, pk := range d.keys[i].PubKeys {
-			if pk == pubkey {
-				idx = i
-				break
-			}
-		}
-		if idx != -1 {
+		if d.keys[i].PubKey == pubkey {
+			idx = i
 			break
 		}
 	}
@@ -376,36 +488,66 @@ func (d *DB) UpdateKeyField(pubkey, field string, newValue any) error {
 			return fmt.Errorf("field %q expects bool", field)
 		}
 		rec.IsActive = v
-	case "survive_reboot":
+	case "key_expires_at", "keyexpiresat":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		rec.KeyExpiresAt = v
+	case "key_max_containers", "keymaxcontainers":
+		v, ok := newValue.(int)
+		if !ok {
+			return fmt.Errorf("field %q expects int", field)
+		}
+		rec.KeyMaxContainers = v
+	case "dockerfile_path", "dockerfilepath":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		rec.DockerfilePath = v
+	case "containers_expire_after", "containersexpireafter":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		rec.ContainersExpireAfter = v
+	case "containers_survive_reboot", "containerssurvivereboot":
 		v, ok := newValue.(bool)
 		if !ok {
 			return fmt.Errorf("field %q expects bool", field)
 		}
-		rec.SurviveReboot = v
-	case "key_expires_afer", "keyexpiresafter":
-		v, ok := newValue.(time.Duration)
+		rec.ContainersSurviveReboot = v
+	case "containers_killed_after_exit", "containerskilledafterexit":
+		v, ok := newValue.(bool)
 		if !ok {
-			return fmt.Errorf("field %q expects time.Duration", field)
+			return fmt.Errorf("field %q expects bool", field)
 		}
-		rec.KeyExpiresAfter = v
-	case "max_containers", "maxcontainers":
-		v, ok := newValue.(int)
+		rec.ContainersKilledAfterExit = v
+	case "containers_stop_after_exit", "containersstopafterexit":
+		v, ok := newValue.(bool)
 		if !ok {
-			return fmt.Errorf("field %q expects int", field)
+			return fmt.Errorf("field %q expects bool", field)
 		}
-		rec.MaxContainers = v
-	case "containters_count", "containerscount":
-		v, ok := newValue.(int)
+		rec.ContainersStopAfterExit = v
+	case "containers_memory_limit", "containersmemorylimit":
+		v, ok := newValue.(string)
 		if !ok {
-			return fmt.Errorf("field %q expects int", field)
+			return fmt.Errorf("field %q expects string", field)
 		}
-		rec.ContaintersCount = v
-	case "expires_after", "expiresafter":
-		v, ok := newValue.(time.Duration)
+		rec.ContainersMemoryLimit = v
+	case "containers_cpu_limit", "containerscpulimit":
+		v, ok := newValue.(float64)
 		if !ok {
-			return fmt.Errorf("field %q expects time.Duration", field)
+			return fmt.Errorf("field %q expects float64", field)
 		}
-		rec.ExpiresAfter = v
+		rec.ContainersCPULimit = v
+	case "containers_gpu_limit", "containersgpulimit":
+		v, ok := newValue.(string)
+		if !ok {
+			return fmt.Errorf("field %q expects string", field)
+		}
+		rec.ContainersGPULimit = v
 	default:
 		return fmt.Errorf("unsupported field %q on AccessKeyRecord", field)
 	}
@@ -418,7 +560,7 @@ func (d *DB) UpdateKeyField(pubkey, field string, newValue any) error {
 }
 
 // UpdateEnvField safely updates a single field on an ENVs record by ID,
-// then persists envs.json.
+// then persists envs.toml.
 func (d *DB) UpdateEnvField(id, field string, newValue any) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -492,47 +634,42 @@ func (d *DB) deleteEnvByIDLocked(id string) {
 	}
 }
 
-func (d *DB) deleteKeyLocked(pubkey string) {
-	for i := range d.keys {
-		for _, pk := range d.keys[i].PubKeys {
-			if pk == pubkey {
-				d.keys = append(d.keys[:i], d.keys[i+1:]...)
-				return
-			}
-		}
-	}
-}
-
 // =====================================================================
 // REAPER / SWEEPER
 // =====================================================================
 
-// PurgeExpired scans the store, deletes any expired access keys, and
+// PurgeExpired scans the store, flips any expired access keys from
+// active to disabled (persisting the change to access_keys.toml), and
 // forcefully tears down any active environments associated with them.
 // It also purges individually-expired environments.
 func (d *DB) PurgeExpired() {
 	now := time.Now()
 
-	// ---- PART 1: purge expired access keys ----
+	// ---- PART 1: disable expired access keys ----
+	// Re-read access_keys.toml first so operator hand-edits are honored.
+	if err := d.ReloadAccessKeys(); err != nil {
+		log.Printf("[DB] Reaper: failed to reload access keys: %v", err)
+	}
+
 	d.mu.Lock()
 	var expiredKeys []string
-	for _, rec := range d.keys {
-		if rec.KeyExpiresAfter > 0 && rec.CreatedAt.Add(rec.KeyExpiresAfter).Before(now) {
-			expiredKeys = append(expiredKeys, rec.PubKeys...)
+	for i := range d.keys {
+		rec := &d.keys[i]
+		if rec.IsActive && rec.IsExpired(now) {
+			rec.IsActive = false
+			expiredKeys = append(expiredKeys, rec.PubKey)
+		}
+	}
+	if len(expiredKeys) > 0 {
+		if err := d.saveKeysUnlocked(); err != nil {
+			log.Printf("[DB] Reaper: failed to persist disabled keys: %v", err)
 		}
 	}
 	d.mu.Unlock()
 
 	for _, pubkey := range expiredKeys {
-		log.Printf("[DB] Reaper: Actively removing expired public key: %s...", shortKey(pubkey))
+		log.Printf("[DB] Reaper: access key %s... expired, state changed to disabled", shortKey(pubkey))
 		d.purgeEnvironmentsByPubKey(pubkey)
-
-		d.mu.Lock()
-		d.deleteKeyLocked(pubkey)
-		if err := d.saveKeysUnlocked(); err != nil {
-			log.Printf("[DB] Reaper: failed to persist key deletion: %v", err)
-		}
-		d.mu.Unlock()
 	}
 
 	// ---- PART 2: purge individually-expired environments ----
@@ -634,7 +771,7 @@ func (d *DB) purgeEnvironmentsByPubKey(pubkey string) {
 }
 
 // =====================================================================
-// CONFIG LOADER (keys.json source-of-truth import)
+// PARSING HELPERS
 // =====================================================================
 
 // parseDurationWithDays supports a trailing 'd' suffix (e.g. "30d") in
@@ -655,123 +792,33 @@ func parseDurationWithDays(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-// LoadAccessKeysConf reads the source JSON config file (the format you
-// hand-author / ship), parses durations, and upserts each entry into the
-// in-memory + on-disk keys.json store, keyed by matching PubKeys slices.
-func (d *DB) LoadAccessKeysConf(filePath string) (map[string]AccessKeyRecord, error) {
-	fileBytes, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	var rawList []struct {
-		IsActive        bool           `json:"active"`
-		SurviveReboot   bool           `json:"survive_reboot"`
-		PubKeys         []string       `json:"pubkey"`
-		KeyExpiresAfter string         `json:"key_expires_afer"`
-		MaxContainers   int            `json:"max_containers"`
-		Environment     EnvConfigSlice `json:"environment"`
-		CreatedAt       string         `json:"created_at"`
-		ExpiresAfter    string         `json:"expires_after"`
-	}
-	if err := json.Unmarshal(fileBytes, &rawList); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	records := make(map[string]AccessKeyRecord, len(rawList))
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	for _, item := range rawList {
-		keyExpire, err := parseDurationWithDays(item.KeyExpiresAfter)
-		if err != nil {
-			id := "unknown"
-			if len(item.PubKeys) > 0 {
-				id = shortKey(item.PubKeys[0])
-			}
-			return nil, fmt.Errorf("key %s has invalid key_expires_after: %w", id, err)
-		}
-
-		// Validate only the "container" type is used, per current scope.
-		for _, env := range item.Environment {
-			if env.Type != "container" {
-				return nil, fmt.Errorf("unsupported environment type %q (only \"container\" is currently supported)", env.Type)
-			}
-		}
-
-		createdAt := time.Now()
-		if item.CreatedAt != "" {
-			if t, err := time.Parse(time.RFC3339, item.CreatedAt); err == nil {
-				createdAt = t
-			}
-		}
-		var expiresAfter time.Duration
-		if item.ExpiresAfter != "" {
-			if v, err := parseDurationWithDays(item.ExpiresAfter); err == nil {
-				expiresAfter = v
-			}
-		}
-
-		record := AccessKeyRecord{
-			IsActive:        item.IsActive,
-			SurviveReboot:   item.SurviveReboot,
-			PubKeys:         item.PubKeys,
-			KeyExpiresAfter: keyExpire,
-			Environment:     item.Environment,
-			MaxContainers:   item.MaxContainers,
-			CreatedAt:       createdAt,
-			ExpiresAfter:    expiresAfter,
-		}
-
-		// Upsert: match an existing record sharing ANY pubkey, else append.
-		matchedIdx := -1
-		for i := range d.keys {
-			if sliceShareElement(d.keys[i].PubKeys, item.PubKeys) {
-				matchedIdx = i
-				break
-			}
-		}
-		if matchedIdx != -1 {
-			// Preserve original CreatedAt / counters, refresh the rest.
-			existing := d.keys[matchedIdx]
-			record.CreatedAt = existing.CreatedAt
-			record.ContaintersCount = existing.ContaintersCount
-			d.keys[matchedIdx] = record
-		} else {
-			d.keys = append(d.keys, record)
-		}
-
-		for _, pk := range item.PubKeys {
-			records[pk] = record
-		}
-	}
-
-	if err := d.saveKeysUnlocked(); err != nil {
-		return nil, fmt.Errorf("failed to persist keys.json: %w", err)
-	}
-
-	log.Printf("ENV confs loaded into memoey from %s\n", filePath)
-
-	return records, nil
-}
-
-func sliceShareElement(a, b []string) bool {
-	set := make(map[string]struct{}, len(a))
-	for _, v := range a {
-		set[v] = struct{}{}
-	}
-	for _, v := range b {
-		if _, ok := set[v]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 func shortKey(k string) string {
 	if len(k) > 8 {
 		return k[:8]
 	}
 	return k
+}
+
+func AreEqual(key string, WireKey []byte) bool {
+	log.Println(key)
+	Found_pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(key))
+	if err != nil {
+		log.Printf("[auth] skipping malformed accesskey_keys line: invalid: %v", err)
+
+	}
+	Found_pubKeyBytes := Found_pubKey.Marshal()
+
+	SSH_presentedPubKey, err := ssh.NewPublicKey(ed25519.PublicKey(WireKey))
+	if err != nil {
+		log.Printf("[auth] presented key invalid: %v", err)
+		return false
+	}
+
+	SSH_presentedPubKey_bytes := SSH_presentedPubKey.Marshal()
+
+	if !bytes.Equal(SSH_presentedPubKey_bytes, Found_pubKeyBytes) {
+		log.Printf("[auth] skipping authorized_keys line presented key not egual with the key server found \n")
+		return false
+	}
+	return true
 }

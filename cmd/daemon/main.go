@@ -1,41 +1,42 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"os"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/the-mhdi/shellforge/shellforge" // Preserved your custom module import
 	cli "github.com/urfave/cli/v2"
 )
 
-// JSONDaemonConfig represents the fields inside your daemon config JSON file
-type JSONDaemonConfig struct {
-	AcceptedInitMsgs                []string `json:"AcceptedInitMsgs"`
-	DaemonInitMsg                   string   `json:"DaemonInitMsg"`
-	ListenAddr                      string   `json:"ListenAddr"`
-	Port                            string   `json:"Port"` // default 77
-	PasswordAuth                    bool     `json:"PasswordAuth"`
-	PublicKeyAuth                   bool     `json:"PublicKeyAuth"`
-	AuthorizedKeysPath              string   `json:"AuthorizedKeysPath"`
-	AllowLoginAsRoot                bool     `json:"AllowLoginAsRoot"`
-	MaxConnectionsAllowed           uint32   `json:"MaxConnectionsAllowed"`
-	MaxContainersConnectionsAllowed uint32   `json:"MaxContainersConnectionsAllowed"`
-	EnvironmentsJsonConfig          string   `json:"EnvironmentsJsonConfig"`
-	DatabaseDirectory               string   `json:"DatabaseDirectory"`
-	HostKeyPath                     string   `json:"HostKeyPath"`
+const DAEMON_CONFIG_FILE_DEFAULT string = "/etc/shellforge/config"
+
+// TOMLDaemonConfig represents the fields inside your daemon config TOML file
+type TOMLDaemonConfig struct {
+	AcceptedInitMsgs                []string `toml:"AcceptedInitMsgs"`
+	DaemonInitMsg                   string   `toml:"DaemonInitMsg"`
+	ListenAddr                      string   `toml:"ListenAddr"`
+	Port                            string   `toml:"Port"` // default 77
+	PasswordAuth                    bool     `toml:"PasswordAuth"`
+	PublicKeyAuth                   bool     `toml:"PublicKeyAuth"`
+	AuthorizedKeysPath              string   `toml:"AuthorizedKeysPath"`
+	AllowLoginAsRoot                bool     `toml:"AllowLoginAsRoot"`
+	MaxConnectionsAllowed           uint32   `toml:"MaxConnectionsAllowed"`
+	MaxContainersConnectionsAllowed uint32   `toml:"MaxContainersConnectionsAllowed"`
+	DatabaseDirectory               string   `toml:"DatabaseDirectory"`
+	HostKeyPath                     string   `toml:"HostKeyPath"`
 }
 
-// LoadDaemonConfig reads the JSON file from disk and parses it [1, 2]
-func LoadDaemonConfig(path string) (*JSONDaemonConfig, error) {
+// LoadDaemonConfig reads the TOML file from disk and parses it [1, 2]
+func LoadDaemonConfig(path string) (*TOMLDaemonConfig, error) {
 	bytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg := &JSONDaemonConfig{}
-	if err := json.Unmarshal(bytes, cfg); err != nil {
+	cfg := &TOMLDaemonConfig{}
+	if err := toml.Unmarshal(bytes, cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -53,23 +54,17 @@ func main() {
 				Usage:   "TCP listen address (e.g., 0.0.0.0:77)",
 			},
 			&cli.StringFlag{
-				Name:    "envsConf",
-				Aliases: []string{"ec"},
-				Usage:   "Path to the environments configuration JSON file",
-			},
-			&cli.StringFlag{
 				Name:    "config",
 				Aliases: []string{"c"},
-				Usage:   "Path to a daemon configuration JSON file",
+				Usage:   "Path to a daemon configuration TOML file",
 			},
 		},
 		Action: func(cCtx *cli.Context) error {
 			cliListen := cCtx.String("listen")
-			cliEnvs := cCtx.String("envsConf")
 			configPath := cCtx.String("config")
 
 			// 1. Resolve and merge configurations dynamically [1, 2, 3]
-			runDaemon(cliListen, cliEnvs, configPath)
+			runDaemon(cliListen, configPath)
 			return nil
 		},
 	}
@@ -80,7 +75,7 @@ func main() {
 	}
 }
 
-func runDaemon(listenAddr, ENVsJsonConfDir, configPath string) {
+func runDaemon(listenAddr, configPath string) {
 
 	// 4. defalut Construct the final shellforge.DaemonConfig
 	conf := shellforge.DaemonConfig{
@@ -94,60 +89,55 @@ func runDaemon(listenAddr, ENVsJsonConfDir, configPath string) {
 		AuthorizedKeysPath:              "",
 		MaxConnectionsAllowed:           0,
 		MaxContainersConnectionsAllowed: 0,
-		EnvironmentsJsonConfig:          "",
 		ClientInitHandler:               nil,
 	}
 
 	if configPath == "" {
-		configPath = "/etc/shellforge/config.json"
+		configPath = DAEMON_CONFIG_FILE_DEFAULT
 	}
 
 	log.Printf("[Daemon] Loading configuration file: %s", configPath)
 
-	jsonConfig, err := LoadDaemonConfig(configPath)
+	tomlConfig, err := LoadDaemonConfig(configPath)
 	if err != nil {
 		log.Printf("failed to load config file: %v", err)
 		return
 	}
 
-	// If the JSON config was successfully loaded, overwrite the defaults [1]
-	if jsonConfig != nil {
-		if len(jsonConfig.AcceptedInitMsgs) > 0 {
-			conf.AcceptedInitMsgs = jsonConfig.AcceptedInitMsgs
+	// If the TOML config was successfully loaded, overwrite the defaults [1]
+	if tomlConfig != nil {
+		if len(tomlConfig.AcceptedInitMsgs) > 0 {
+			conf.AcceptedInitMsgs = tomlConfig.AcceptedInitMsgs
 		}
-		if jsonConfig.DaemonInitMsg != "" {
-			conf.DaemonInitMsg = jsonConfig.DaemonInitMsg
+		if tomlConfig.DaemonInitMsg != "" {
+			conf.DaemonInitMsg = tomlConfig.DaemonInitMsg
 		}
-		conf.PasswordAuth = jsonConfig.PasswordAuth
-		conf.PublicKeyAuth = jsonConfig.PublicKeyAuth
-		conf.AllowLoginAsRoot = jsonConfig.AllowLoginAsRoot
+		conf.PasswordAuth = tomlConfig.PasswordAuth
+		conf.PublicKeyAuth = tomlConfig.PublicKeyAuth
+		conf.AllowLoginAsRoot = tomlConfig.AllowLoginAsRoot
 
-		if jsonConfig.AuthorizedKeysPath != "" {
-			conf.AuthorizedKeysPath = jsonConfig.AuthorizedKeysPath
+		if tomlConfig.AuthorizedKeysPath != "" {
+			conf.AuthorizedKeysPath = tomlConfig.AuthorizedKeysPath
 		}
-		if jsonConfig.ListenAddr != "" {
-			conf.ListenAddr = jsonConfig.ListenAddr
+		if tomlConfig.ListenAddr != "" {
+			conf.ListenAddr = tomlConfig.ListenAddr
 		}
-		if jsonConfig.Port != "" {
-			conf.Port = jsonConfig.Port
-		}
-
-		if jsonConfig.MaxConnectionsAllowed != 0 {
-			conf.MaxConnectionsAllowed = jsonConfig.MaxConnectionsAllowed
+		if tomlConfig.Port != "" {
+			conf.Port = tomlConfig.Port
 		}
 
-		if jsonConfig.MaxContainersConnectionsAllowed != 0 {
-			conf.MaxConnectionsAllowed = jsonConfig.MaxConnectionsAllowed
+		if tomlConfig.MaxConnectionsAllowed != 0 {
+			conf.MaxConnectionsAllowed = tomlConfig.MaxConnectionsAllowed
 		}
 
-		if jsonConfig.EnvironmentsJsonConfig != "" {
-			conf.EnvironmentsJsonConfig = jsonConfig.EnvironmentsJsonConfig
+		if tomlConfig.MaxContainersConnectionsAllowed != 0 {
+			conf.MaxConnectionsAllowed = tomlConfig.MaxConnectionsAllowed
 		}
 
-		if jsonConfig.DatabaseDirectory != "" {
-			conf.DatabaseDir = jsonConfig.DatabaseDirectory
+		if tomlConfig.DatabaseDirectory != "" {
+			conf.DatabaseDir = tomlConfig.DatabaseDirectory
 		}
-		// Map additional fields from your JSON config...
+		// Map additional fields from your TOML config...
 	}
 
 	if listenAddr != "" {
@@ -160,8 +150,6 @@ func runDaemon(listenAddr, ENVsJsonConfDir, configPath string) {
 			conf.Port = s[1]
 		}
 	}
-
-	conf.EnvironmentsJsonConfig = ENVsJsonConfDir
 
 	shellforge.Start(conf)
 }

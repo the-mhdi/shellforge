@@ -54,102 +54,6 @@ func NewStream(s *Session) *stream {
 	return p
 }
 
-/*
-func (p *stream) dispatcher() {
-
-		for {
-			ch := &Channel{}
-			//	= binary.BigEndian.Uint32(data[offset : offset+4])
-			n, err := p.ring.Read(p.idLen[:])
-			if n != 4 {
-				p.ring.Reset()
-				continue
-			}
-			if err != nil {
-				log.Println(err)
-				p.ring.Reset()
-				continue
-			}
-			ch.ChannelID = binary.BigEndian.Uint32(p.idLen[:])
-
-			n, err = p.ring.Read(p.dataLen[:])
-
-			if n != 4 {
-				p.ring.Reset()
-				continue
-			}
-			if err != nil {
-				log.Println(err)
-				p.ring.Reset()
-				continue
-			}
-			ch.DataLen = binary.BigEndian.Uint32(p.dataLen[:])
-
-			data, err := p.ring.ReadExactly(int(ch.DataLen))
-			if err != nil {
-				p.ring.Reset()
-				continue
-			}
-
-			if chann, ok := p.getActiveChannel(ch.ChannelID); ok {
-				_, err := chann.Feed(data)
-				if err != nil {
-					log.Println(err)
-					log.Printf("channel %d feed failed: %v; closing", chann.id, err)
-					p.session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
-					chann.Close()
-
-				}
-			} else {
-				log.Printf("Received Data with unknown Channel ID")
-				continue
-				//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
-			}
-
-			/*
-					if p.closed {
-						return
-					}
-					ch, err := p.ring.Dequeue()
-					if err == ErrIsEmpty {
-						runtime.Gosched()
-						continue
-					}
-					if c, ok := ch.(*Channel); ok {
-						if chann, ok := p.getActiveChannel(c.ChannelID); ok {
-							_, err := chann.Feed(c.Data)
-							if err != nil {
-								log.Println(err)
-								log.Printf("channel %d feed failed: %v; closing", chann.id, err)
-								p.session.WritePacket(MsgServerChannelClosed, (&ChannelClosed{ChannelID: chann.id}))
-								chann.Close()
-
-							}
-						} else {
-							log.Printf("Received Data with unknown Channel ID: %d", chann.id)
-							//p.session.WritePacket(MsgServerChannelUnknownOrClosed, nil)
-						}
-					}
-				}
-
-		}
-	}
-
-/*
-// Feed is called by the main Event Loop when a packet arrives for this Channel ID
-
-	func (p *stream) Feed(data []byte) error {
-		if p.closed {
-			return io.ErrClosedPipe
-		}
-		_, err := p.ring.Write(data)
-		if err == nil {
-			runtime.Gosched()
-			//p.notEmpty.Signal()
-		}
-		return err
-	}
-*/
 func (p *stream) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -285,7 +189,7 @@ func (st *stream) NewChannel(sessionTie bool) (uint32, *channel) {
 		id:          st.IncrementChannelID(),
 		stream:      st,
 		sessionTied: sessionTie,
-		ring:        make([]byte, PIPE_RING_CAPACITY),
+		ring:        make([]byte, CHANNEL_RING_CAPACITY),
 	}
 	p.notEmpty = sync.NewCond(&p.mu)
 	st.addActiveChannel(p.id, p)
@@ -297,7 +201,7 @@ func (st *stream) NewChannelWithID(id uint32, sessionTie bool) (*channel, bool) 
 		id:          id,
 		stream:      st,
 		sessionTied: sessionTie,
-		ring:        make([]byte, PIPE_RING_CAPACITY),
+		ring:        make([]byte, CHANNEL_RING_CAPACITY),
 	}
 	p.notEmpty = sync.NewCond(&p.mu)
 	ok := st.addActiveChannelIfAbsent(p.id, p)
@@ -457,7 +361,7 @@ func (p *channel) Close() error {
 
 	p.stream.deleteActiveChannel(p.id)
 
-	if p.sessionTied {
+	if p.sessionTied && (p.stream.session.stopping.Load() == false) {
 		p.stream.session.Close()
 	}
 	return nil
@@ -496,7 +400,7 @@ func (ch *channel) AddIO(IO io.ReadWriteCloser) error {
 	if ch.R != nil {
 		return errors.New("Chnnel already attached to an IO device")
 	}
-	ch.C = IO
+	ch.R = IO
 	if ch.R != nil {
 		return errors.New("Chnnel already attached to an IO device")
 	}
@@ -515,7 +419,7 @@ func (ch *channel) AttachIO(IO io.ReadWriteCloser) error {
 	if ch.R != nil {
 		return errors.New("Chnnel already attached to an IO device")
 	}
-	ch.C = IO
+	ch.R = IO
 	if ch.R != nil {
 		return errors.New("Chnnel already attached to an IO device")
 	}
