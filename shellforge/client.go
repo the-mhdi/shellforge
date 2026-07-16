@@ -95,7 +95,7 @@ type Client struct {
 
 }
 
-func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Client {
+func NewClientWithInitMsg(ctx context.Context, daemonAddr string, conf *ClientConfig, InitMsg string) *Client {
 	// Create a robust dialer with Keep-Alives and Fast Open
 
 	dOpts := &tcp.DialOptions{
@@ -138,6 +138,10 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 		conf.ClientInitMessage = CLIENT_VERSION_STRING
 	}
 
+	if InitMsg != "" {
+		conf.ClientInitMessage = InitMsg
+	}
+
 	return &Client{
 		DaemonAddr:            daemonAddr,
 		conf:                  conf,
@@ -151,6 +155,10 @@ func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Clie
 		context:               ctx,
 		cancel:                cancel,
 	}
+}
+
+func NewClient(ctx context.Context, daemonAddr string, conf *ClientConfig) *Client {
+	return NewClientWithInitMsg(ctx, daemonAddr, conf, "")
 }
 
 func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
@@ -180,7 +188,7 @@ func (c *Client) ConnectWithNoAuth(ctx context.Context) error {
 	}
 	if initRes.Payload[0] != MsgServerInit {
 		log.Printf("Unexpected Msg Type From Server expected: %d, received: %d: Not A Server INIT Msg", MsgServerInit, initRes.Payload[0])
-		tempSession.Close()
+		//tempSession.Close()
 		return ErrUnexpectedMsgType
 
 	}
@@ -454,7 +462,7 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 	tempSession := NewSession(conn)
 	tempSession.isDaemon = false // We are the client
-
+	//c.session = tempSession
 	// ==========================================
 	// PHASE 1: INIT EXCHANGE
 	// ==========================================
@@ -469,7 +477,6 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 	}
 	if initRes.Payload[0] != MsgServerInit {
 		log.Printf("Unexpected Msg Type From Server expected: %d, received: %d: Not A Server INIT Msg", MsgServerInit, initRes.Payload[0])
-		tempSession.Close()
 		return ErrUnexpectedMsgType
 
 	}
@@ -948,7 +955,6 @@ func (c *Client) eventLoop() {
 		pkt, err := c.session.ReadPacket()
 		if err != nil {
 			log.Printf("Disconnected From Server: %v\r\n", err)
-			c.session.closeConn()
 			break
 		}
 
@@ -961,7 +967,6 @@ func (c *Client) eventLoop() {
 					log.Printf("[Success] Server is now listening on public port: %s", res.Address)
 				} else {
 					log.Printf("[Error] Server failed to open public port: %s", res.Address)
-					c.Close()
 					return
 				}
 			}
@@ -1257,7 +1262,9 @@ func (c *Client) ForwardLocalToRemote(ctx context.Context, localListenAddr strin
 }
 
 func (c *Client) Close() error {
-	c.session.Close()
+	if c.session != nil {
+		return c.session.Close()
+	}
 	return nil
 }
 
@@ -1567,8 +1574,9 @@ func (c *Client) GetAndRunContainer(containerName string, signer crypto.Signer) 
 			log.Printf("Container approved! Assigned ChannelID: %d. Hooking up terminal...", res.ChannelID)
 			return c.startInteractivePTY(res.ChannelID, stdinFd)
 
-		case listRes := <-listCh: // FIXED: Now this case is 100% reachable and will unblock!
-			fmt.Printf("\r\n[Error] Container %q not found on server.\r\n", containerName)
+		case listRes := <-listCh:
+			//fmt.Printf("\r\n[Error] Container %q not found on server.\r\n", containerName)
+			fmt.Println()
 			fmt.Println("Available active containers for your key:")
 			for _, name := range listRes.ContainersList {
 				fmt.Printf("  - %s\r\n", name)

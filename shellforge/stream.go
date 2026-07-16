@@ -361,7 +361,7 @@ func (p *channel) Close() error {
 
 	p.stream.deleteActiveChannel(p.id)
 
-	if p.sessionTied && (p.stream.session.stopping.Load() == false) {
+	if p.sessionTied && p.stream.session.IsAlive {
 		p.stream.session.Close()
 	}
 	return nil

@@ -23,8 +23,6 @@ const MAX_PACKET_LEN uint32 = (MAX_PAYLOAD_LEN + 5 + 512 + 64) //64 * 1024 + 4+1
 const MIN_PACKET_LEN uint32 = 4                                // Minimum packet size to prevent abuse (e.g., empty packets)
 const MAX_AUTH_RETRY uint8 = 5
 
-const CLEANUP_INTERVAL time.Duration = 5 * time.Minute
-
 // PIPE_BUFFER_SIZE uint32        = (4 * 1024) //4kb
 
 // We partition the 32-bit ID space using the top bit, and both peers agree on
@@ -229,6 +227,7 @@ type Session struct {
 	mu        sync.Mutex // Protects the TCP connection swap for session resume and close
 	closeOnce sync.Once
 	stopping  atomic.Bool
+	IsAlive   bool
 	Closed    chan struct{} // Signals when the session is closed (used by Dialer to unblock)
 
 	deadlineMu    sync.Mutex  // guards the session-wide deadline timer below
@@ -246,7 +245,9 @@ func NewSession(conn net.Conn) *Session {
 		shells:     make(map[uint32]*Shell),
 		forwardMap: make(map[string]string),
 		Closed:     make(chan struct{}),
+		IsAlive:    true,
 	}
+
 	s.Stream = NewStream(s)
 	return s
 }
@@ -566,13 +567,19 @@ func (s *Session) CloseWithSignal(timeout time.Duration) error {
 	return s.shutdown()
 }
 
-func (s *Session) Close() error { return s.shutdown() }
+func (s *Session) Close() error {
+
+	return s.shutdown()
+
+	//return errors.New("[SESSION NOTICE] Session is being stopped, can't call close twice")
+}
 
 func (s *Session) shutdown() error {
 
 	var closeErr error
 	s.closeOnce.Do(func() {
 		s.stopping.Store(true)
+		s.IsAlive = false
 		close(s.Closed)
 		// Kill any armed deadline timer so it can't fire on a dead session.
 		s.deadlineMu.Lock()

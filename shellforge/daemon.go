@@ -34,6 +34,8 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+const CLEANUP_INTERVAL time.Duration = 5 * time.Minute
+
 // to-do: add error handling and malformed packet handling to the server event loop to handle bad network speed and packet losts
 // to-do: add a max packet corruption handled to server
 // to-do: add a max packet corruption handled to server, if a session exceeds this threshold we can terminate it to prevent abuse or potential
@@ -410,7 +412,7 @@ func (d *Daemon) listen() {
 				var conList []string
 
 				for _, env := range envs {
-					conList = append(conList, env.Name)
+					conList = append(conList, env.UserRequestedName)
 				}
 
 				clist := &ContainersListResponse{
@@ -1542,6 +1544,9 @@ func (d *Daemon) CreateEnvironment(ctx context.Context, p *channel, sessionID st
 		return nil, err
 	}
 
+	if d.DB.UserRequestedNameExists(string(eReq.UserRequestedName), eReq.PublicKey) {
+		return nil, ErrDuplicateEnvName
+	}
 	requestedType := strings.ToLower(strings.TrimSpace(string(eReq.AccessType)))
 
 	switch requestedType {

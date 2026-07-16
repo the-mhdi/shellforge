@@ -87,6 +87,9 @@ func main() {
 		waiting()
 	default:
 		err = runDefaultMode(ctx, args, configOverride)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 }
@@ -240,7 +243,7 @@ func runContainerCommand(ctx context.Context, command, nameAtHost, configOverrid
 // connectClient is a shared helper that builds the client, connects, and
 // loads the signer — avoids repeating these three steps in every mode func.
 func connectClient(ctx context.Context, hostport, configOverride string) (*shellforge.Client, crypto.Signer, error) {
-	client, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride, "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -266,7 +269,7 @@ func getContainers(ctx context.Context, args []string, configOverride string) er
 	}
 	hostport := withDefaultPort(args[0])
 
-	client, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride, "")
 	if err != nil {
 		return err
 	}
@@ -308,7 +311,7 @@ func runMakeMode(ctx context.Context, args []string, configOverride string) erro
 		return fmt.Errorf("unsupported env type %q", envType)
 	}
 
-	client, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride, "")
 	if err != nil {
 		return err
 	}
@@ -346,16 +349,18 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	var localFwds, remoteFwds multiFlag
 	var dynamicFwd string
+	var initmsg string
 	fs.Var(&localFwds, "L", "local port forward local_port:remote_ip:remote_port (repeatable)")
 	fs.Var(&remoteFwds, "R", "remote port forward remote_port:local_ip:local_port (repeatable)")
 	fs.StringVar(&dynamicFwd, "D", "", "dynamic SOCKS5 forward port")
+	fs.StringVar(&initmsg, "I", "", "INIT messege to send to server")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 
-	client, err := newClient(ctx, hostport, configOverride)
+	client, err := newClient(ctx, hostport, configOverride, initmsg)
 	if err != nil {
-		defer client.Close()
+		log.Println(err)
 		return err
 	}
 	defer client.Close()
@@ -382,7 +387,6 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 				return err
 			}
 			if err := client.Connect(ctx, user); err != nil {
-
 				return err
 			}
 
@@ -401,10 +405,8 @@ func runDefaultMode(ctx context.Context, args []string, configOverride string) e
 	log.Println("[CLI] Launching interactive shell...")
 	if err := client.Connect(ctx, user); err != nil {
 		log.Println(err)
-		defer client.Close()
 		return err
 	}
-	defer client.Close()
 	return client.RequestShell("/bin/bash", user)
 }
 
@@ -508,11 +510,11 @@ func resolveConfigDir(override string) string {
 // newClient resolves the config directory, loads the private key and
 // JSON config overrides, builds the shellforge.ClientConfig (including
 // the PrivateKey field your Connect() relies on), and constructs the client.
-func newClient(ctx context.Context, hostport, configOverride string) (*shellforge.Client, error) {
+func newClient(ctx context.Context, hostport, configOverride string, initMsg string) (*shellforge.Client, error) {
 	configDir := resolveConfigDir(configOverride)
 
 	conf, err := buildConfig(configDir)
-	client := shellforge.NewClient(ctx, hostport, conf)
+	client := shellforge.NewClientWithInitMsg(ctx, hostport, conf, initMsg)
 	if err != nil {
 		log.Printf("[ERROR] faild to load config file, %v", err)
 		client = shellforge.NewClient(ctx, hostport, nil)

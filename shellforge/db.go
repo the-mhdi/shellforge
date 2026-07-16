@@ -357,6 +357,18 @@ func (d *DB) GetENVByUserReqestedName(name string, key []byte) (*ENVs, error) {
 	return nil, nil
 }
 
+func (d *DB) UserRequestedNameExists(name string, key []byte) bool {
+	if name != "" {
+		for _, e := range d.envs {
+			if e.UserRequestedName == name && AreEqual(e.PubKey, key) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 func (d *DB) GetENVByname(name string, key []byte) (*ENVs, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -800,7 +812,7 @@ func shortKey(k string) string {
 }
 
 func AreEqual(key string, WireKey []byte) bool {
-	log.Println(key)
+	//log.Println(key)
 	Found_pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(key))
 	if err != nil {
 		log.Printf("[auth] skipping malformed accesskey_keys line: invalid: %v", err)
