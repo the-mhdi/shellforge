@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/the-mhdi/shellforge/shellforge" // Preserved your custom module import
@@ -79,13 +80,15 @@ func runDaemon(listenAddr, configPath string) {
 
 	// 4. defalut Construct the final shellforge.DaemonConfig
 	conf := shellforge.DaemonConfig{
-		AcceptedInitMsgs:                []string{"WIREFORGE-1.0"},
-		DaemonInitMsg:                   "WIREFORGE-1.0",
-		ListenAddr:                      "0.0.0.0",
-		Port:                            "77",
-		PasswordAuth:                    true,
-		PublicKeyAuth:                   true,
-		AllowLoginAsRoot:                true,
+		AcceptedInitMsgs: []string{"SHELLFORGE-v0.1.0"},
+		DaemonInitMsg:    "SHELLFORGE-v0.1.0",
+		ListenAddr:       "0.0.0.0",
+		Port:             "77",
+		PasswordAuth:     true,
+		PublicKeyAuth:    true,
+		AllowLoginAsRoot: true,
+		HandshakeTimeout: 30 * time.Second,
+		//IdleTimeout:                     30 * time.Minute,
 		AuthorizedKeysPath:              "",
 		MaxConnectionsAllowed:           0,
 		MaxContainersConnectionsAllowed: 0,
@@ -101,7 +104,7 @@ func runDaemon(listenAddr, configPath string) {
 	tomlConfig, err := LoadDaemonConfig(configPath)
 	if err != nil {
 		log.Printf("failed to load config file: %v", err)
-		return
+		//return
 	}
 
 	// If the TOML config was successfully loaded, overwrite the defaults [1]

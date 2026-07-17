@@ -497,6 +497,7 @@ func (d *Daemon) listen() {
 	}
 	//blocking call that handles the life cycle of the listener and incoming connections
 	opts.Listen(address, handler)
+	d.Cancel()
 
 }
 
