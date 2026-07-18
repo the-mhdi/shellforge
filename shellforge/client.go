@@ -784,20 +784,24 @@ func (c *Client) Connect(ctx context.Context, username string) error {
 
 						pkt, err := c.session.ReadPacket()
 						if err != nil {
-							return fmt.Errorf("failed to read authentication response: %w", err)
+							//return fmt.Errorf("failed to read authentication response: %w", err)
+							continue
 						}
 
 						if pkt.Payload[0] == MsgServerAuthFailed {
-							return fmt.Errorf("[AUTH] Authentication failed, disconnecting...")
+							log.Println(fmt.Errorf("[AUTH] pubkey Authentication failed"))
+							continue
 						}
 
 						if pkt.Payload[0] != MsgServerAuthResponse {
-							return fmt.Errorf("unexpected message type from server during authentication expected: %d, got %d", MsgServerAuthResponse, pkt.Payload[0])
+							log.Println(fmt.Errorf("unexpected message type from server during authentication expected: %d, got %d", MsgServerAuthResponse, pkt.Payload[0]))
+							continue
 						}
 
 						ar, err := ParseAuthResponse(pkt.Payload[1:])
 						if err != nil {
-							return fmt.Errorf("failed to parse authentication response: %w", err)
+							log.Println(fmt.Errorf("failed to parse authentication response: %w", err))
+							continue
 						}
 
 						if ar.Success && ar.AuthType == AuthMethodPublicKey && ar.Username == username {
